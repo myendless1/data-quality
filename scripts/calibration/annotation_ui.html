@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BBox Annotation</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #15171a;
+      --panel: #20242a;
+      --line: #3a414b;
+      --text: #f1f3f5;
+      --muted: #aeb6c2;
+      --grasp: #35a7ff;
+      --place: #ffb238;
+      --ok: #4fd18b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      min-height: 100vh;
+    }
+    .stage {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      overflow: hidden;
+    }
+    .canvas-wrap {
+      position: relative;
+      width: min(calc(100vw - 356px), calc((100vh - 36px) * 16 / 9));
+      aspect-ratio: 16 / 9;
+      border: 1px solid var(--line);
+      background: #050607;
+    }
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+    aside {
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .row { display: flex; gap: 8px; align-items: center; }
+    button {
+      height: 34px;
+      border: 1px solid var(--line);
+      background: #2b3038;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0 12px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button:hover { border-color: #6f7a89; }
+    button.primary { background: #1f6feb; border-color: #3182ff; }
+    button.full { width: 100%; }
+    button.active[data-tool="grasp"] { background: color-mix(in srgb, var(--grasp) 34%, #20242a); border-color: var(--grasp); }
+    button.active[data-tool="place"] { background: color-mix(in srgb, var(--place) 34%, #20242a); border-color: var(--place); }
+    .meta {
+      line-height: 1.5;
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-word;
+    }
+    .title {
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 750;
+    }
+    .status {
+      min-height: 22px;
+      color: var(--ok);
+      font-size: 13px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      margin-right: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    kbd {
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 1px 5px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; grid-template-rows: auto 360px; }
+      aside { border-left: 0; border-top: 1px solid var(--line); }
+      .canvas-wrap { width: calc(100vw - 36px); }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="stage">
+      <div class="canvas-wrap"><canvas id="canvas" width="1280" height="720"></canvas></div>
+    </section>
+    <aside>
+      <div class="title" id="sampleTitle">Loading</div>
+      <div class="meta" id="sampleMeta"></div>
+      <div class="row">
+        <button data-tool="grasp" class="active">grasp</button>
+        <button data-tool="place">place</button>
+      </div>
+      <div class="row">
+        <button id="prevBtn">Prev</button>
+        <button id="nextBtn">Next</button>
+      </div>
+      <div class="row">
+        <button id="clearBtn">Clear Active</button>
+        <button id="clearAllBtn">Clear Both</button>
+      </div>
+      <div>
+        <span class="pill">1/2 switch</span>
+        <span class="pill">A/D prev next</span>
+        <span class="pill">S save</span>
+      </div>
+      <div class="status" id="status"></div>
+      <button id="saveBtn" class="primary full">Save All</button>
+    </aside>
+  </main>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const title = document.getElementById('sampleTitle');
+    const meta = document.getElementById('sampleMeta');
+    const statusEl = document.getElementById('status');
+    const colors = { grasp: '#35a7ff', place: '#ffb238' };
+    let manifest = null;
+    let annotations = { samples: [], width: 1280, height: 720 };
+    let index = 0;
+    let tool = 'grasp';
+    let image = new Image();
+    let drag = null;
+
+    function annotationMap() {
+      const map = new Map();
+      for (const item of annotations.samples || []) map.set(item.sample_id, item);
+      return map;
+    }
+
+    function currentSample() { return manifest.samples[index]; }
+
+    function currentAnnotation(create = true) {
+      const sample = currentSample();
+      let item = (annotations.samples || []).find(x => x.sample_id === sample.sample_id);
+      if (!item && create) {
+        item = { sample_id: sample.sample_id, task: sample.task, episode_id: sample.episode_id, bboxes: {} };
+        annotations.samples.push(item);
+      }
+      return item;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+      if (text) setTimeout(() => { if (statusEl.textContent === text) statusEl.textContent = ''; }, 1600);
+    }
+
+    function nextToolForSample() {
+      const ann = currentAnnotation(false);
+      if (!ann?.bboxes?.grasp) return 'grasp';
+      if (!ann?.bboxes?.place) return 'place';
+      return 'grasp';
+    }
+
+    function canvasPoint(evt) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(1280, (evt.clientX - rect.left) * 1280 / rect.width)),
+        y: Math.max(0, Math.min(720, (evt.clientY - rect.top) * 720 / rect.height)),
+      };
+    }
+
+    function normalizedBox(a, b) {
+      const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+      return { x, y, w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) };
+    }
+
+    function drawBox(box, name) {
+      if (!box) return;
+      ctx.save();
+      ctx.strokeStyle = colors[name];
+      ctx.lineWidth = 4;
+      ctx.strokeRect(box.x, box.y, box.w, box.h);
+      ctx.fillStyle = colors[name];
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(box.x + box.w / 2, box.y + box.h / 2, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.font = 'bold 22px system-ui';
+      ctx.fillText(name, box.x + 8, Math.max(26, box.y - 8));
+      ctx.restore();
+    }
+
+    function render() {
+      ctx.clearRect(0, 0, 1280, 720);
+      if (image.complete) ctx.drawImage(image, 0, 0, 1280, 720);
+      const ann = currentAnnotation(false);
+      if (ann?.bboxes) {
+        drawBox(ann.bboxes.grasp, 'grasp');
+        drawBox(ann.bboxes.place, 'place');
+      }
+      if (drag) drawBox(normalizedBox(drag.start, drag.now), tool);
+    }
+
+    function loadSample(nextIndex) {
+      index = Math.max(0, Math.min(manifest.samples.length - 1, nextIndex));
+      const sample = currentSample();
+      title.textContent = `${index + 1}/${manifest.samples.length} ${sample.task} episode ${sample.episode_id}`;
+      meta.textContent = `${sample.file}`;
+      image = new Image();
+      image.onload = render;
+      image.src = `/data/${sample.image}`;
+      setTool(nextToolForSample());
+    }
+
+    async function save(message = 'Saved') {
+      annotations.width = 1280;
+      annotations.height = 720;
+      annotations.camera = manifest.camera;
+      const res = await fetch('/api/annotations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(annotations),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setStatus(message);
+    }
+
+    function setTool(next) {
+      tool = next;
+      document.querySelectorAll('[data-tool]').forEach(btn => btn.classList.toggle('active', btn.dataset.tool === tool));
+    }
+
+    async function advanceAfterBox() {
+      const ann = currentAnnotation(false);
+      await save(`${tool} saved`);
+      if (tool === 'grasp') {
+        setTool('place');
+        setStatus('grasp saved, draw place');
+        return;
+      }
+      if (ann?.bboxes?.grasp && ann?.bboxes?.place) {
+        setStatus('sample saved');
+        if (index < manifest.samples.length - 1) {
+          setTimeout(() => loadSample(index + 1), 260);
+        }
+      }
+    }
+
+    canvas.addEventListener('mousedown', evt => {
+      const p = canvasPoint(evt);
+      drag = { start: p, now: p };
+      render();
+    });
+    canvas.addEventListener('mousemove', evt => {
+      if (!drag) return;
+      drag.now = canvasPoint(evt);
+      render();
+    });
+    window.addEventListener('mouseup', () => {
+      if (!drag) return;
+      const box = normalizedBox(drag.start, drag.now);
+      drag = null;
+      if (box.w >= 3 && box.h >= 3) {
+        const ann = currentAnnotation();
+        ann.bboxes ||= {};
+        ann.bboxes[tool] = box;
+        advanceAfterBox();
+      }
+      render();
+    });
+    document.querySelectorAll('[data-tool]').forEach(btn => btn.onclick = () => setTool(btn.dataset.tool));
+    document.getElementById('prevBtn').onclick = async () => {
+      await save('Saved before previous');
+      loadSample(index - 1);
+    };
+    document.getElementById('nextBtn').onclick = async () => {
+      await save('Saved before next');
+      loadSample(index + 1);
+    };
+    document.getElementById('saveBtn').onclick = () => save('Saved all');
+    document.getElementById('clearBtn').onclick = async () => {
+      const ann = currentAnnotation();
+      ann.bboxes ||= {};
+      delete ann.bboxes[tool];
+      render();
+      await save(`${tool} cleared`);
+    };
+    document.getElementById('clearAllBtn').onclick = async () => {
+      const ann = currentAnnotation();
+      ann.bboxes = {};
+      render();
+      await save('Both cleared');
+    };
+    window.addEventListener('keydown', async evt => {
+      if (evt.key === '1') setTool('grasp');
+      if (evt.key === '2') setTool('place');
+      if (evt.key.toLowerCase() === 'a') {
+        await save('Saved before previous');
+        loadSample(index - 1);
+      }
+      if (evt.key.toLowerCase() === 'd') {
+        await save('Saved before next');
+        loadSample(index + 1);
+      }
+      if (evt.key.toLowerCase() === 's') save();
+    });
+
+    async function init() {
+      manifest = await (await fetch('/api/manifest')).json();
+      annotations = await (await fetch('/api/annotations')).json();
+      annotations.samples ||= [];
+      loadSample(0);
+      setStatus(`Loaded ${annotations.samples.length} saved samples`);
+    }
+    init().catch(err => {
+      title.textContent = 'Failed to load';
+      meta.textContent = String(err);
+    });
+  </script>
+</body>
+</html>
