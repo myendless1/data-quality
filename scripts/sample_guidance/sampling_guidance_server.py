@@ -14,6 +14,8 @@ import re
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,8 +45,17 @@ DEFAULT_GRASP_HEIGHT_M = 0.7821216622438248
 DEFAULT_CENTRIFUGE_PLACE_HEIGHT_M = 0.8658671177760737
 DEFAULT_MULTIDROP_PLACE_HEIGHT_M = 0.7886867696617663
 DEFAULT_SAMPLE_CACHE_PATH = SCRIPT_DIR / "sampling_guidance_pair_cache.json"
-DEFAULT_COLLECTION_ROOT = SCRIPT_DIR / "collection_inbox"
+DEFAULT_CENTRIFUGE_COLLECTION_DIR = Path(
+    "/home/astribot/Desktop/data/disk/trans/hdf5_output_centrifuge"
+)
+DEFAULT_MULTIDROP_COLLECTION_DIR = Path(
+    "/home/astribot/Desktop/data/disk/trans/hdf5_output_multidrop"
+)
 COLLECTION_FILE_SUFFIXES = {".hdf5", ".h5"}
+DEFAULT_COLLECTION_FINAL_DESCENT_TOLERANCE_M = 0.005  # 0.5 cm horizontal drift in the final 1 cm descent
+DEFAULT_COLLECTION_DESCENT_WINDOW_M = 0.01  # final 1 cm of vertical descent
+DEFAULT_COLLECTION_GRIPPER_HALF_THRESHOLD = 0.5  # processed gripper value below this = closed more than half
+DEFAULT_COLLECTION_GRIPPER_HALF_CLOSE_MAX = 1  # at most one close-to-half event allowed
 FIXED_DATASET_JOINT_VALUES = {
     0: -0.019,
     1: -0.008,
@@ -101,6 +112,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF_PATH)
     parser.add_argument("--right-arm-urdf", type=Path, default=DEFAULT_RIGHT_ARM_URDF_PATH)
     parser.add_argument("--background", type=Path, default=DEFAULT_BACKGROUND_PATH)
+    parser.add_argument(
+        "--recommend-live-stream-url",
+        default="http://127.0.0.1:8088/stream.mjpg",
+        help="MJPEG URL used as the live background for the recommendation view.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8876)
     parser.add_argument("--candidate-grid", type=int, default=90)
@@ -112,18 +128,42 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--centrifuge-collection-dir",
         type=Path,
-        default=DEFAULT_COLLECTION_ROOT / "centrifuge",
+        default=DEFAULT_CENTRIFUGE_COLLECTION_DIR,
     )
     parser.add_argument(
         "--multidrop-collection-dir",
         type=Path,
-        default=DEFAULT_COLLECTION_ROOT / "multidrop",
+        default=DEFAULT_MULTIDROP_COLLECTION_DIR,
     )
     parser.add_argument("--collection-position-tolerance-m", type=float, default=0.03)
     parser.add_argument("--collection-rotation-tolerance-deg", type=float, default=20.0)
     parser.add_argument("--collection-scan-interval-s", type=float, default=0.8)
     parser.add_argument("--collection-file-stable-s", type=float, default=1.0)
     parser.add_argument("--collection-read-timeout-s", type=float, default=10.0)
+    parser.add_argument(
+        "--collection-final-descent-tolerance-m",
+        type=float,
+        default=DEFAULT_COLLECTION_FINAL_DESCENT_TOLERANCE_M,
+        help="Max horizontal displacement (m) allowed during the final descent window.",
+    )
+    parser.add_argument(
+        "--collection-descent-window-m",
+        type=float,
+        default=DEFAULT_COLLECTION_DESCENT_WINDOW_M,
+        help="Vertical descent window (m) inspected at the end of the place motion.",
+    )
+    parser.add_argument(
+        "--collection-gripper-half-threshold",
+        type=float,
+        default=DEFAULT_COLLECTION_GRIPPER_HALF_THRESHOLD,
+        help="Processed gripper value below this counts as closed more than half.",
+    )
+    parser.add_argument(
+        "--collection-gripper-half-close-max",
+        type=int,
+        default=DEFAULT_COLLECTION_GRIPPER_HALF_CLOSE_MAX,
+        help="Max number of close-more-than-half events allowed in one episode.",
+    )
     parser.add_argument("--workspace-xy", default="0.18,0.65,-0.45,0.20")
     parser.add_argument("--grasp-height", type=float, default=DEFAULT_GRASP_HEIGHT_M)
     parser.add_argument("--centrifuge-place-height", type=float, default=DEFAULT_CENTRIFUGE_PLACE_HEIGHT_M)
@@ -796,6 +836,7 @@ class SamplingState:
         urdf: Path,
         right_arm_urdf: Path,
         background: Path,
+        recommend_live_stream_url: str,
         candidate_grid: int,
         top_k: int,
         sample_count: int,
@@ -813,6 +854,10 @@ class SamplingState:
         collection_scan_interval_s: float,
         collection_file_stable_s: float,
         collection_read_timeout_s: float,
+        collection_final_descent_tolerance_m: float,
+        collection_descent_window_m: float,
+        collection_gripper_half_threshold: float,
+        collection_gripper_half_close_max: int,
         orientation_neighbors: int,
         object_length_cm: float,
         object_width_cm: float,
@@ -835,6 +880,7 @@ class SamplingState:
         self.urdf = urdf
         self.right_arm_urdf = right_arm_urdf
         self.background = background
+        self.recommend_live_stream_url = recommend_live_stream_url
         self.candidate_grid = candidate_grid
         self.top_k = top_k
         self.sample_count = sample_count
@@ -858,6 +904,10 @@ class SamplingState:
         self.collection_scan_interval_s = max(0.1, float(collection_scan_interval_s))
         self.collection_file_stable_s = max(0.0, float(collection_file_stable_s))
         self.collection_read_timeout_s = max(0.0, float(collection_read_timeout_s))
+        self.collection_final_descent_tolerance_m = max(0.0, float(collection_final_descent_tolerance_m))
+        self.collection_descent_window_m = max(0.001, float(collection_descent_window_m))
+        self.collection_gripper_half_threshold = float(collection_gripper_half_threshold)
+        self.collection_gripper_half_close_max = max(0, int(collection_gripper_half_close_max))
         self.object_length_m = object_length_cm / 100.0
         self.object_width_m = object_width_cm / 100.0
         self.block_corridor_m = block_corridor_cm / 100.0
@@ -900,9 +950,13 @@ class SamplingState:
         self.collection_events: list[dict[str, object]] = []
         self.collection_next_event_id = 1
         self.collection_error: str | None = None
-        self.init_collection_dirs()
         self.cache_signature = self.build_sample_cache_signature()
         self.load_sample_cache()
+        self.init_collection_dirs()
+        try:
+            self.reconcile_collection_with_cache()
+        except Exception as exc:
+            self.collection_error = f"启动校对失败：{type(exc).__name__}: {exc}"
         if self.precompute_count > 0:
             for task in TASKS:
                 self.ensure_pool_async(task, self.precompute_count)
@@ -928,10 +982,147 @@ class SamplingState:
         for task in TASKS:
             directory = self.collection_dirs[task]
             directory.mkdir(parents=True, exist_ok=True)
-            self.collection_known_files[task] = {
-                str(path.resolve())
-                for path in list_collection_files(directory)
-            }
+            self.collection_known_files[task] = set()
+
+    def reconcile_collection_with_cache(self) -> None:
+        """Enforce one-to-one correspondence between collected cache entries and files.
+
+        Already-collected cache entries are authoritative: a file that is bound to a
+        collected entry (by ``source_file``) is confirmed without re-running the strict
+        trajectory checks — those checks only apply to *newly* collected data. A file
+        not bound to any collected entry is treated as new: matched to the nearest
+        uncollected sample point, validated with the full check set, and kept or deleted.
+        Collected entries whose file has disappeared are unmarked so the sample point
+        becomes collectable again.
+        """
+        for task in TASKS:
+            directory = self.collection_dirs[task]
+            files = list_collection_files(directory)
+            surviving_paths: set[str] = set()
+            bound_indices: set[int] = set()
+            for path in files:
+                resolved = str(path.resolve())
+                try:
+                    analysis = self.extract_episode_analysis(path)
+                except Exception as exc:
+                    self._reject_and_delete(
+                        task, path, -1, None,
+                        [f"启动校对：文件读取失败 {type(exc).__name__}: {exc}"], {}, {},
+                    )
+                    continue
+                with self.pool_condition:
+                    # 1) Authoritative binding by source_file.
+                    matched_pair = None
+                    for pair in self.sample_pools[task]:
+                        if not bool(pair.get("collected", False)):
+                            continue
+                        src = pair.get("source_file")
+                        if src and str(Path(src).resolve()) == resolved:
+                            matched_pair = pair
+                            break
+                    # 2) Rebind by pose proximity (position+rotation only) if source_file
+                    #    was lost. The strict trajectory checks are NOT applied here —
+                    #    already-collected data is grandfathered.
+                    if matched_pair is None:
+                        best = None
+                        best_dist = float("inf")
+                        for pair in self.sample_pools[task]:
+                            if not bool(pair.get("collected", False)):
+                                continue
+                            idx = pair.get("index")
+                            if idx in bound_indices:
+                                continue
+                            if not self._poses_within_tolerance(analysis, pair):
+                                continue
+                            d = self._pair_pose_distance(analysis, pair)
+                            if d is not None and d < best_dist:
+                                best_dist = d
+                                best = pair
+                        if best is not None:
+                            best["source_file"] = resolved
+                            matched_pair = best
+                            self.save_sample_cache_unlocked()
+                    if matched_pair is not None:
+                        bound_indices.add(matched_pair.get("index"))
+                        surviving_paths.add(resolved)
+                        continue
+                # 3) Genuinely new file: full validation against nearest uncollected.
+                handled = self.process_collection_file(task, path, {})
+                if handled and path.exists():
+                    surviving_paths.add(str(path.resolve()))
+            # Unmark collected entries whose file has disappeared.
+            with self.pool_condition:
+                changed = False
+                for pair in self.sample_pools[task]:
+                    if not bool(pair.get("collected", False)):
+                        continue
+                    src = pair.get("source_file")
+                    if src and str(Path(src).resolve()) not in surviving_paths:
+                        pair["collected"] = False
+                        pair["source_file"] = None
+                        changed = True
+                if changed:
+                    self.save_sample_cache_unlocked()
+            self.collection_known_files[task] = surviving_paths
+
+    def _poses_within_tolerance(
+        self, analysis: dict[str, object], pair: dict[str, object]
+    ) -> bool:
+        """Position+rotation only check (original tolerance), no trajectory checks."""
+        keyposes: dict[str, np.ndarray] = analysis.get("keyposes", {})  # type: ignore[assignment]
+        for keypose in KEYPOSES:
+            actual = keyposes.get(keypose)
+            expected_raw = pair.get(keypose)
+            if actual is None or not isinstance(expected_raw, dict):
+                return False
+            actual_pos = np.asarray(actual[:3], dtype=float)
+            actual_quat = np.asarray(actual[3:7], dtype=float)
+            try:
+                expected_pos = np.asarray(
+                    [expected_raw["tool_x"], expected_raw["tool_y"], expected_raw["tool_z"]],
+                    dtype=float,
+                )
+                expected_quat = np.asarray(
+                    [expected_raw["qx"], expected_raw["qy"], expected_raw["qz"], expected_raw["qw"]],
+                    dtype=float,
+                )
+            except (KeyError, TypeError):
+                return False
+            if not (np.all(np.isfinite(actual_pos)) and np.all(np.isfinite(actual_quat))
+                    and np.all(np.isfinite(expected_pos)) and np.all(np.isfinite(expected_quat))):
+                return False
+            if float(np.linalg.norm(actual_pos - expected_pos)) >= self.collection_position_tolerance_m:
+                return False
+            try:
+                if quat_error_deg(actual_quat, expected_quat) >= self.collection_rotation_tolerance_deg:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def _pair_pose_distance(
+        self, analysis: dict[str, object], pair: dict[str, object]
+    ) -> float | None:
+        keyposes = analysis.get("keyposes", {})
+        ag = keyposes.get("grasp")
+        ap = keyposes.get("place")
+        if ag is None or ap is None:
+            return None
+        ag = np.asarray(ag[:3], dtype=float)
+        ap = np.asarray(ap[:3], dtype=float)
+        g = pair.get("grasp")
+        p = pair.get("place")
+        if not isinstance(g, dict) or not isinstance(p, dict):
+            return None
+        try:
+            eg = np.asarray([g["tool_x"], g["tool_y"], g["tool_z"]], dtype=float)
+            ep = np.asarray([p["tool_x"], p["tool_y"], p["tool_z"]], dtype=float)
+        except (KeyError, TypeError):
+            return None
+        if not (np.all(np.isfinite(ag)) and np.all(np.isfinite(ap))
+                and np.all(np.isfinite(eg)) and np.all(np.isfinite(ep))):
+            return None
+        return float(np.linalg.norm(ag - eg) + np.linalg.norm(ap - ep))
 
     def push_collection_event(self, event: dict[str, object]) -> None:
         with self.collection_lock:
@@ -986,6 +1177,7 @@ class SamplingState:
     def scan_collection_dirs(self) -> None:
         now = time.monotonic()
         ready: list[tuple[str, Path, dict[str, object]]] = []
+        retry_interval = max(self.collection_scan_interval_s, 2.0)
         with self.collection_lock:
             for task in TASKS:
                 seen_now: set[str] = set()
@@ -1001,35 +1193,40 @@ class SamplingState:
                     signature = (stat.st_mtime_ns, stat.st_size)
                     pending = self.collection_pending_files[task].get(key)
                     if pending is None or pending.get("signature") != signature:
-                        with self.pool_condition:
-                            reference = self.current_pair_reference_unlocked(task)
-                        if reference is None:
-                            continue
-                        pair_index, pair = reference
                         self.collection_pending_files[task][key] = {
                             "signature": signature,
                             "stable_since": now,
                             "first_seen": now,
-                            "pair_index": pair_index,
-                            "pair": pair,
+                            "last_attempt": 0.0,
+                            "pending_notified": False,
                         }
                         continue
                     stable_since = float(pending.get("stable_since", now))
                     first_seen = float(pending.get("first_seen", now))
-                    if (
-                        now - stable_since >= self.collection_file_stable_s
-                        or now - first_seen >= self.collection_read_timeout_s
-                    ):
+                    last_attempt = float(pending.get("last_attempt", 0.0))
+                    is_stable = now - stable_since >= self.collection_file_stable_s
+                    timed_out = now - first_seen >= self.collection_read_timeout_s
+                    due_for_attempt = now - last_attempt >= retry_interval
+                    if (is_stable or timed_out) and due_for_attempt:
                         ready.append((task, path, dict(pending)))
-                        self.collection_pending_files[task].pop(key, None)
-                        self.collection_known_files[task].add(key)
                 for key in list(self.collection_pending_files[task]):
                     if key not in seen_now:
                         self.collection_pending_files[task].pop(key, None)
         for task, path, pending in ready:
-            self.process_collection_file(task, path, pending)
+            handled = self.process_collection_file(task, path, pending)
+            key = str(path.resolve())
+            with self.collection_lock:
+                if handled:
+                    self.collection_pending_files[task].pop(key, None)
+                    self.collection_known_files[task].add(key)
+                else:
+                    entry = self.collection_pending_files[task].get(key)
+                    if entry is not None:
+                        entry["last_attempt"] = time.monotonic()
+                        entry["pending_notified"] = True
 
-    def extract_keypose_poses(self, path: Path) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    def extract_episode_analysis(self, path: Path) -> dict[str, object]:
+        """Read the full right-arm trajectory + gripper signal and detect keypose frames."""
         with h5py.File(path, "r") as h5:
             raw_gripper = np.asarray(h5[f"{self.gripper_group}/astribot_gripper_{self.arm}"])
             poses = np.asarray(h5[f"{self.pose_group}/astribot_arm_{self.arm}"], dtype=float)
@@ -1047,13 +1244,121 @@ class SamplingState:
                 continue
             keyposes[keypose] = np.asarray(poses[int(frame)], dtype=float)
             frame_values[keypose] = int(frame)
-        return keyposes, frame_values
+        return {
+            "keyposes": keyposes,
+            "frame_values": frame_values,
+            "poses": poses,
+            "gripper": gripper,
+        }
+
+    def extract_keypose_poses(self, path: Path) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+        analysis = self.extract_episode_analysis(path)
+        return analysis["keyposes"], analysis["frame_values"]  # type: ignore[return-value]
+
+    def final_descent_horizontal_drift(
+        self, poses: np.ndarray, place_frame: int | None
+    ) -> float | None:
+        """Max net horizontal drift (m) over the final ``descent_window_m`` of vertical drop.
+
+        Walks backward from the place frame until the smoothed z has risen by
+        ``collection_descent_window_m``; returns the xy displacement between the
+        segment endpoints, or ``None`` if no descent segment could be found.
+        """
+        if poses is None or place_frame is None or place_frame <= 0 or place_frame >= poses.shape[0]:
+            return None
+        z = np.asarray(poses[: place_frame + 1, 2], dtype=float)
+        if z.size < 2:
+            return None
+        smoothed = smooth_centered(z, self.z_smooth_window)
+        end_z = float(smoothed[-1])
+        target_z = end_z + self.collection_descent_window_m
+        # Walk backward to find where z first reaches target_z (start of the final descent).
+        start_idx = None
+        for i in range(smoothed.size - 1, -1, -1):
+            if np.isfinite(smoothed[i]) and smoothed[i] >= target_z:
+                start_idx = i
+                break
+        if start_idx is None:
+            # Whole descent is shorter than the window; use the available descent start.
+            finite = np.flatnonzero(np.isfinite(smoothed))
+            if finite.size < 2:
+                return None
+            start_idx = int(finite[0])
+        if start_idx >= place_frame:
+            return None
+        start_xy = np.asarray(poses[start_idx, :2], dtype=float)
+        end_xy = np.asarray(poses[place_frame, :2], dtype=float)
+        if not (np.all(np.isfinite(start_xy)) and np.all(np.isfinite(end_xy))):
+            return None
+        return float(np.linalg.norm(end_xy - start_xy))
+
+    def gripper_half_close_intervals(self, gripper: np.ndarray) -> list[tuple[int, int]]:
+        """Contiguous intervals where the processed gripper is closed more than half."""
+        if gripper is None or gripper.size == 0:
+            return []
+        signal = np.isfinite(gripper) & (gripper < self.collection_gripper_half_threshold)
+        intervals: list[tuple[int, int]] = []
+        i = 0
+        n = signal.size
+        while i < n:
+            if signal[i]:
+                j = i
+                while j + 1 < n and signal[j + 1]:
+                    j += 1
+                intervals.append((int(i), int(j)))
+                i = j + 1
+            else:
+                i += 1
+        return intervals
+
+    def find_nearest_uncollected_pair_unlocked(
+        self, task: str, analysis: dict[str, object]
+    ) -> tuple[int, dict[str, object]] | None:
+        """Return the uncollected pool entry whose grasp+place tool pose is closest."""
+        keyposes = analysis.get("keyposes", {})
+        actual_grasp = keyposes.get("grasp")
+        actual_place = keyposes.get("place")
+        if actual_grasp is None or actual_place is None:
+            return None
+        ag = np.asarray(actual_grasp[:3], dtype=float)
+        ap = np.asarray(actual_place[:3], dtype=float)
+        if not (np.all(np.isfinite(ag)) and np.all(np.isfinite(ap))):
+            return None
+        best_index = -1
+        best_pair: dict[str, object] | None = None
+        best_dist = float("inf")
+        for pair in self.sample_pools[task]:
+            if bool(pair.get("collected", False)):
+                continue
+            g = pair.get("grasp")
+            p = pair.get("place")
+            if not isinstance(g, dict) or not isinstance(p, dict):
+                continue
+            try:
+                eg = np.asarray([g["tool_x"], g["tool_y"], g["tool_z"]], dtype=float)
+                ep = np.asarray([p["tool_x"], p["tool_y"], p["tool_z"]], dtype=float)
+            except (KeyError, TypeError):
+                continue
+            if not (np.all(np.isfinite(eg)) and np.all(np.isfinite(ep))):
+                continue
+            dist = float(np.linalg.norm(ag - eg) + np.linalg.norm(ap - ep))
+            if dist < best_dist:
+                best_dist = dist
+                best_index = int(pair.get("index", -1))
+                best_pair = pair
+        if best_pair is None:
+            return None
+        return best_index, dict(best_pair)
 
     def compare_collection_to_pair(
         self,
-        actual_poses: dict[str, np.ndarray],
+        analysis: dict[str, object],
         pair: dict[str, object],
     ) -> tuple[bool, list[str], dict[str, object]]:
+        actual_poses: dict[str, np.ndarray] = analysis.get("keyposes", {})  # type: ignore[assignment]
+        frame_values: dict[str, int] = analysis.get("frame_values", {})  # type: ignore[assignment]
+        poses: np.ndarray = analysis.get("poses")  # type: ignore[assignment]
+        gripper: np.ndarray = analysis.get("gripper")  # type: ignore[assignment]
         metrics: dict[str, object] = {}
         reasons: list[str] = []
         for keypose in KEYPOSES:
@@ -1119,43 +1424,81 @@ class SamplingState:
                     f"{keypose} 旋转误差 {rotation_error_deg:.1f}deg >= "
                     f"{self.collection_rotation_tolerance_deg:.1f}deg"
                 )
+        # Final-descent horizontal drift check.
+        drift = self.final_descent_horizontal_drift(poses, frame_values.get("place"))
+        if drift is not None:
+            metrics["final_descent_horizontal_drift_m"] = drift
+            if drift > self.collection_final_descent_tolerance_m:
+                reasons.append(
+                    f"末端下降最后 {self.collection_descent_window_m * 100:.1f}cm 水平位移 "
+                    f"{drift * 100:.2f}cm > {self.collection_final_descent_tolerance_m * 100:.2f}cm"
+                )
+        else:
+            metrics["final_descent_horizontal_drift_m"] = None
+        # Gripper single-close check (right arm cannot close > half more than once).
+        intervals = self.gripper_half_close_intervals(gripper)
+        metrics["gripper_half_close_intervals"] = len(intervals)
+        if len(intervals) > self.collection_gripper_half_close_max:
+            reasons.append(
+                f"右臂关闭夹爪超过一半的次数 {len(intervals)} > "
+                f"{self.collection_gripper_half_close_max}（多次关闭夹爪）"
+            )
         return not reasons, reasons, metrics
 
-    def process_collection_file(self, task: str, path: Path, pending: dict[str, object]) -> None:
-        pair_index = int(pending.get("pair_index", -1))
-        pair = pending.get("pair")
-        if not isinstance(pair, dict):
+    def process_collection_file(self, task: str, path: Path, pending: dict[str, object]) -> bool:
+        """Validate a new collection file. Returns True if handled (accepted/deleted), False if it should retry."""
+        try:
+            analysis = self.extract_episode_analysis(path)
+        except Exception as exc:
+            self._reject_and_delete(task, path, -1, None, [f"文件读取或解析失败：{type(exc).__name__}: {exc}"], {}, {})
+            return True
+        keyposes = analysis.get("keyposes", {})
+        frames = analysis.get("frame_values", {})
+        if keyposes.get("grasp") is None or keyposes.get("place") is None:
+            self._reject_and_delete(
+                task, path, -1, None,
+                ["未检测到 grasp/place 关键帧（夹爪闭合段或下降段缺失）"],
+                {}, frames,
+            )
+            return True
+        # Match to the nearest uncollected sample point in the pool.
+        with self.pool_condition:
+            reference = self.find_nearest_uncollected_pair_unlocked(task, analysis)
+        if reference is None:
+            # Pool has no uncollected candidates yet; leave the file to retry later.
             self.push_collection_event(
                 {
                     "task": task,
-                    "status": "rejected",
+                    "status": "pending",
                     "file": str(path),
-                    "message": "推荐 pair 缺失，文件未校验",
-                    "reasons": ["推荐 pair 缺失"],
+                    "pair_index": -1,
+                    "message": "暂无未采集的采样点可匹配，稍后重试",
+                    "reasons": ["无可匹配采样点"],
                     "deleted": False,
                     "advance": False,
                 }
             )
-            return
+            return False
+        pair_index, pair = reference
         try:
-            actual_poses, frames = self.extract_keypose_poses(path)
-            ok, reasons, metrics = self.compare_collection_to_pair(actual_poses, pair)
+            ok, reasons, metrics = self.compare_collection_to_pair(analysis, pair)
         except Exception as exc:
             ok = False
-            frames = {}
             metrics = {}
-            reasons = [f"文件读取或解析失败：{type(exc).__name__}: {exc}"]
-        deleted = False
-        delete_error = None
+            reasons = [f"校验失败：{type(exc).__name__}: {exc}"]
         if ok:
             completed = False
             with self.pool_condition:
-                if 0 <= pair_index < len(self.sample_pools[task]):
-                    cached_pair = self.sample_pools[task][pair_index]
-                    if cached_pair.get("index") == pair.get("index"):
-                        cached_pair["collected"] = True
-                        self.save_sample_cache_unlocked()
-                        completed = True
+                cached_pair = None
+                for candidate in self.sample_pools[task]:
+                    if candidate.get("index") == pair.get("index") and not bool(candidate.get("collected", False)):
+                        cached_pair = candidate
+                        break
+                if cached_pair is not None:
+                    cached_pair["collected"] = True
+                    cached_pair["source_file"] = str(path.resolve())
+                    self.save_sample_cache_unlocked()
+                    completed = True
                 if completed:
                     self.pool_condition.notify_all()
             if not completed:
@@ -1165,28 +1508,43 @@ class SamplingState:
                         "status": "rejected",
                         "file": str(path),
                         "pair_index": pair.get("index", pair_index),
-                        "message": "采集姿态有效，但推荐 pair 已变化，文件保留且未计完成",
-                        "reasons": ["推荐 pair 已变化，未计入完成"],
+                        "message": "采集姿态有效，但匹配的采样点已被占用，文件保留且未计完成",
+                        "reasons": ["匹配采样点已被占用"],
                         "metrics": metrics,
                         "frames": frames,
                         "deleted": False,
                         "advance": False,
                     }
                 )
-                return
+                return True
             self.push_collection_event(
                 {
                     "task": task,
                     "status": "accepted",
                     "file": str(path),
                     "pair_index": pair.get("index", pair_index),
-                    "message": "采集有效，已完成当前 pair",
+                    "message": "采集有效，已匹配并完成最近采样点",
                     "metrics": metrics,
                     "frames": frames,
                     "advance": True,
                 }
             )
-            return
+            return True
+        self._reject_and_delete(task, path, pair.get("index", pair_index), pair, reasons, metrics, frames)
+        return True
+
+    def _reject_and_delete(
+        self,
+        task: str,
+        path: Path,
+        pair_index: int,
+        pair: dict[str, object] | None,
+        reasons: list[str],
+        metrics: dict[str, object],
+        frames: dict[str, int],
+    ) -> None:
+        deleted = False
+        delete_error = None
         try:
             path.unlink()
             deleted = True
@@ -1200,7 +1558,7 @@ class SamplingState:
                 "task": task,
                 "status": "rejected",
                 "file": str(path),
-                "pair_index": pair.get("index", pair_index),
+                "pair_index": pair.get("index", pair_index) if pair else pair_index,
                 "message": message,
                 "reasons": reasons,
                 "metrics": metrics,
@@ -1870,7 +2228,7 @@ class SamplingState:
         task = raw_task if raw_task in TASKS else "centrifuge"
         raw_count = query.get("count", [str(self.sample_count)])[0]
         try:
-            count = max(1, min(1000, int(raw_count)))
+            count = max(1, min(self.sample_count, int(raw_count)))
         except ValueError:
             count = self.sample_count
         points: list[dict[str, object]] = []
@@ -1897,6 +2255,9 @@ class SamplingState:
             "sample_count": self.sample_count,
             "precompute_count": self.precompute_count,
             "sample_cache": str(self.sample_cache),
+            "recommend_live_stream_path": "/api/head-rgbd-stream.mjpg"
+            if self.recommend_live_stream_url
+            else None,
             "tasks": list(TASKS),
             "collection": {
                 "dirs": {
@@ -1943,6 +2304,9 @@ class GuidanceHandler(BaseHTTPRequestHandler):
         if path == "/api/background":
             self.send_json({"data_url": self.state.background_data_url()})
             return
+        if path == "/api/head-rgbd-stream.mjpg":
+            self.proxy_recommend_live_stream()
+            return
         if path == "/api/config":
             self.send_json(self.state.config_payload())
             return
@@ -1968,6 +2332,41 @@ class GuidanceHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def proxy_recommend_live_stream(self) -> None:
+        url = self.state.recommend_live_stream_url
+        if not url:
+            self.send_error(404)
+            return
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "sampling-guidance-live-background/1.0",
+                "Cache-Control": "no-cache",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5.0) as upstream:
+                content_type = upstream.headers.get(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame",
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if not self.wfile.closed:
+                self.send_error(502, f"Live stream unavailable: {exc}")
+
 
 def main() -> None:
     args = build_argparser().parse_args()
@@ -1978,6 +2377,7 @@ def main() -> None:
         urdf=args.urdf,
         right_arm_urdf=args.right_arm_urdf,
         background=args.background,
+        recommend_live_stream_url=args.recommend_live_stream_url,
         candidate_grid=args.candidate_grid,
         top_k=args.top_k,
         sample_count=args.sample_count,
@@ -2001,6 +2401,10 @@ def main() -> None:
         collection_scan_interval_s=args.collection_scan_interval_s,
         collection_file_stable_s=args.collection_file_stable_s,
         collection_read_timeout_s=args.collection_read_timeout_s,
+        collection_final_descent_tolerance_m=args.collection_final_descent_tolerance_m,
+        collection_descent_window_m=args.collection_descent_window_m,
+        collection_gripper_half_threshold=args.collection_gripper_half_threshold,
+        collection_gripper_half_close_max=args.collection_gripper_half_close_max,
         orientation_neighbors=args.orientation_neighbors,
         object_length_cm=args.object_length_cm,
         object_width_cm=args.object_width_cm,

@@ -70,6 +70,17 @@
       background: #050607;
       overflow: hidden;
     }
+    .live-background {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: none;
+    }
+    .live-background.ready {
+      display: block;
+    }
     .board.distribution {
       align-self: start;
     }
@@ -211,7 +222,10 @@
           <strong>推荐窗口</strong>
           <span id="recommendMeta"></span>
         </div>
-        <div class="canvas-wrap"><canvas id="recommendCanvas" width="1280" height="720"></canvas></div>
+        <div class="canvas-wrap">
+          <img id="recommendLiveBackground" class="live-background" alt="">
+          <canvas id="recommendCanvas" width="1280" height="720"></canvas>
+        </div>
       </div>
       <div class="board distribution">
         <div class="title">
@@ -223,12 +237,12 @@
     </section>
     <section class="controls">
       <select id="taskSelect" aria-label="任务">
-        <option value="centrifuge">centrifuge</option>
-        <option value="multidrop">multidrop</option>
+        <option value="centrifuge">离心机</option>
+        <option value="multidrop">分液器</option>
       </select>
       <button id="sampleBtn">下一条</button>
-      <span class="legend"><span class="dot" style="background: var(--grasp)"></span>grasp</span>
-      <span class="legend"><span class="dot" style="background: var(--place)"></span>place</span>
+      <span class="legend"><span class="dot" style="background: var(--grasp)"></span>抓</span>
+      <span class="legend"><span class="dot" style="background: var(--place)"></span>放</span>
       <span class="pill" id="status">加载中</span>
     </section>
   </main>
@@ -238,6 +252,7 @@
     const recommendCanvas = document.getElementById('recommendCanvas');
     const mainCtx = mainCanvas.getContext('2d');
     const recommendCtx = recommendCanvas.getContext('2d');
+    const recommendLiveBackground = document.getElementById('recommendLiveBackground');
     const mainMeta = document.getElementById('mainMeta');
     const recommendMeta = document.getElementById('recommendMeta');
     const statusEl = document.getElementById('status');
@@ -245,6 +260,16 @@
     const taskSelect = document.getElementById('taskSelect');
     const colors = { grasp: '#2aa8ff', place: '#ffb23f' };
     const candidateColors = { grasp: '#6ae6ff', place: '#ffe07a' };
+    const taskLabels = { centrifuge: '离心机', multidrop: '分液器' };
+    const keyposeLabels = { grasp: '抓', place: '放' };
+    const rejectLabels = {
+      overlap: '重叠',
+      blocked: '路径遮挡',
+      box: '框越界',
+      direction: '方向不符',
+      grasp_ik: '抓IK失败',
+      place_ik: '放IK失败'
+    };
     let background = new Image();
     let mainPayload = null;
     let recommendPayload = null;
@@ -256,6 +281,7 @@
     let lastCollectionEventId = 0;
     let collectionPollTimer = null;
     let toastTimer = null;
+    let recommendLiveReady = false;
 
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
@@ -283,9 +309,53 @@
         .replaceAll("'", '&#39;');
     }
 
+    function taskLabel(task) {
+      return taskLabels[task] || task || '未知任务';
+    }
+
+    function keyposeLabel(keypose) {
+      return keyposeLabels[keypose] || keypose || '未知姿态';
+    }
+
+    function translateVisibleText(value) {
+      return String(value || '')
+        .replaceAll('grasp_ik', '抓IK失败')
+        .replaceAll('place_ik', '放IK失败')
+        .replaceAll('graspIK', '抓IK失败')
+        .replaceAll('placeIK', '放IK失败')
+        .replaceAll('grasp', '抓')
+        .replaceAll('place', '放')
+        .replaceAll('centrifuge', '离心机')
+        .replaceAll('multidrop', '分液器')
+        .replaceAll('overlap', '重叠')
+        .replaceAll('blocked', '路径遮挡')
+        .replaceAll('projection', '投影失败')
+        .replaceAll('direction', '方向不符')
+        .replaceAll('box', '框越界')
+        .replaceAll('filling', '生成中')
+        .replaceAll('pairs', '样本')
+        .replaceAll('workspace', '工作区')
+        .replaceAll('cache ignored: configuration changed', '缓存已忽略：配置已变化')
+        .replaceAll('cache load failed', '缓存加载失败')
+        .replaceAll('cache save failed', '缓存保存失败')
+        .replaceAll('no candidates available', '没有可用候选点');
+    }
+
+    function errorText(err) {
+      const raw = err?.message || String(err || '');
+      return translateVisibleText(raw.replace(/^Error:\s*/, '')) || '未知错误';
+    }
+
     function drawBackground(ctx) {
       ctx.clearRect(0, 0, 1280, 720);
       if (background.complete) ctx.drawImage(background, 0, 0, 1280, 720);
+    }
+
+    function clearRecommendationCanvas(ctx) {
+      ctx.clearRect(0, 0, 1280, 720);
+      if (!recommendLiveReady && background.complete) {
+        ctx.drawImage(background, 0, 0, 1280, 720);
+      }
     }
 
     function drawArrowHead(ctx, fromX, fromY, toX, toY, size) {
@@ -356,12 +426,15 @@
       ctx.stroke();
       ctx.font = '700 24px system-ui';
       ctx.textBaseline = 'bottom';
-      ctx.fillText(sample.keypose, Math.min(c.x + 18, 1190), Math.max(c.y - 14, 32));
+      ctx.fillText(keyposeLabel(sample.keypose), Math.min(c.x + 18, 1190), Math.max(c.y - 14, 32));
       ctx.restore();
     }
 
     function drawBatchPose(ctx, pose, color, label, options = {}) {
       const drawBox = options.drawBox || false;
+      const labelFont = options.labelFont || '700 11px system-ui';
+      const labelOffsetX = options.labelOffsetX ?? 7;
+      const labelOffsetY = options.labelOffsetY ?? -7;
       const box = pose.box_px || pose.box;
       ctx.save();
       ctx.fillStyle = color;
@@ -417,9 +490,9 @@
         }
       }
       if (label) {
-        ctx.font = '700 11px system-ui';
+        ctx.font = labelFont;
         ctx.textBaseline = 'middle';
-        ctx.fillText(label, pose.x + 7, pose.y - 7);
+        ctx.fillText(label, pose.x + labelOffsetX, pose.y + labelOffsetY);
       }
       ctx.restore();
     }
@@ -465,13 +538,13 @@
 
       const labels = [];
       const batch = data?.batch;
-      if (batch) labels.push(`pairs ${batch.count}/${batch.requested}`);
+      if (batch) labels.push(`样本 ${batch.count}/${batch.requested}`);
       const heights = batch?.heights || {};
       const placeH = heights[`${task}:place`]?.height_m;
-      if (Number.isFinite(placeH)) labels.push(`${task} place ${placeH.toFixed(3)}m`);
+      if (Number.isFinite(placeH)) labels.push(`${taskLabel(task)} 放 ${placeH.toFixed(3)}m`);
       const constraints = batch?.constraints || {};
       if (constraints.workspace_xy) {
-        labels.push(`workspace ${constraints.workspace_xy.map(v => Number(v).toFixed(2)).join(',')}`);
+        labels.push(`工作区 ${constraints.workspace_xy.map(v => Number(v).toFixed(2)).join(',')}`);
       }
       metaEl.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
     }
@@ -487,7 +560,7 @@
     }
 
     function drawRecommendationView(ctx, metaEl, data) {
-      drawBackground(ctx);
+      clearRecommendationCanvas(ctx);
       const pair = data?.batch?.pairs?.[0];
       if (!pair) {
         metaEl.textContent = '无可用推荐';
@@ -495,8 +568,14 @@
       }
       ctx.save();
       ctx.globalAlpha = 0.95;
-      drawBatchPose(ctx, pair.grasp, candidateColors.grasp, 'grasp', { drawBox: true });
-      drawBatchPose(ctx, pair.place, candidateColors.place, 'place', { drawBox: true });
+      const recommendationLabelOptions = {
+        drawBox: true,
+        labelFont: '800 30px system-ui',
+        labelOffsetX: 18,
+        labelOffsetY: -18
+      };
+      drawBatchPose(ctx, pair.grasp, candidateColors.grasp, '抓', recommendationLabelOptions);
+      drawBatchPose(ctx, pair.place, candidateColors.place, '放', recommendationLabelOptions);
       ctx.restore();
 
       const batch = data.batch || {};
@@ -518,7 +597,7 @@
         t: Date.now().toString()
       });
       const res = await fetch(`/api/data?${params.toString()}`, { signal: controller.signal });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw new Error(`请求失败 ${res.status}`);
       return await res.json();
     }
 
@@ -529,7 +608,7 @@
         t: Date.now().toString()
       });
       const res = await fetch(`/api/recommend?${params.toString()}`, { signal: controller.signal });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw new Error(`请求失败 ${res.status}`);
       return await res.json();
     }
 
@@ -539,7 +618,7 @@
         t: Date.now().toString()
       });
       const res = await fetch(`/api/collection-events?${params.toString()}`);
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw new Error(`请求失败 ${res.status}`);
       return await res.json();
     }
 
@@ -553,10 +632,10 @@
           await handleCollectionEvent(event);
         }
         if (payload.error) {
-          setStatus(`采集目录扫描警告：${payload.error}`, true);
+          setStatus(`采集目录扫描警告：${translateVisibleText(payload.error)}`, true);
         }
       } catch (err) {
-        setStatus(`采集事件轮询失败：${err}`, true);
+        setStatus(`采集事件轮询失败：${errorText(err)}`, true);
       }
     }
 
@@ -574,11 +653,11 @@
       }
       if (event.status === 'rejected') {
         const reasons = Array.isArray(event.reasons) && event.reasons.length
-          ? event.reasons
-          : [event.message || '采集文件未通过校验'];
+          ? event.reasons.map(translateVisibleText)
+          : [translateVisibleText(event.message) || '采集文件未通过校验'];
         const title = event.deleted === false ? '采集未通过，文件已保留' : '采集未通过，文件已删除';
         showToast(title, reasons);
-        setStatus(event.message || '采集文件未通过校验', true);
+        setStatus(translateVisibleText(event.message) || '采集文件未通过校验', true);
       }
     }
 
@@ -590,16 +669,16 @@
       const graspH = heights.grasp?.height_m;
       const placeH = heights[`${data.task}:place`]?.height_m;
       const heightText = Number.isFinite(graspH) && Number.isFinite(placeH)
-        ? `；高度 grasp ${graspH.toFixed(3)}m / place ${placeH.toFixed(3)}m`
+        ? `；高度 抓 ${graspH.toFixed(3)}m / 放 ${placeH.toFixed(3)}m`
         : '';
       const reject = batch.reject_counts || {};
-      const rejectText = `；拒绝 overlap ${reject.overlap || 0} blocked ${reject.blocked || 0} box ${reject.box || 0} direction ${reject.direction || 0} graspIK ${reject.grasp_ik || 0} placeIK ${reject.place_ik || 0}`;
+      const rejectText = `；拒绝 ${rejectLabels.overlap} ${reject.overlap || 0} ${rejectLabels.blocked} ${reject.blocked || 0} ${rejectLabels.box} ${reject.box || 0} ${rejectLabels.direction} ${reject.direction || 0} ${rejectLabels.grasp_ik} ${reject.grasp_ik || 0} ${rejectLabels.place_ik} ${reject.place_ik || 0}`;
       const pairCache = batch.cache || {};
       const cacheText = Number.isFinite(pairCache.pool_count)
-        ? `；缓存 ${pairCache.pool_count}/${pairCache.target || 0}${pairCache.filling ? ' filling' : ''}`
+        ? `；缓存 ${pairCache.pool_count}/${pairCache.target || 0}${pairCache.filling ? ' 生成中' : ''}`
         : '';
-      const error = cache.error ? `；扫描警告 ${cache.error}` : '';
-      return `${prefix} ${now.toLocaleTimeString()}；${data.task}；pairs ${batch.count || 0}/${batch.requested || 0}${heightText}${rejectText}${cacheText}${error}`;
+      const error = cache.error ? `；扫描警告 ${translateVisibleText(cache.error)}` : '';
+      return `${prefix} ${now.toLocaleTimeString()}；${taskLabel(data.task)}；样本 ${batch.count || 0}/${batch.requested || 0}${heightText}${rejectText}${cacheText}${error}`;
     }
 
     async function refreshMain() {
@@ -607,7 +686,7 @@
       const task = taskSelect.value;
       if (mainController) mainController.abort();
       mainController = new AbortController();
-      setStatus(`主屏生成中：${task}，${mainCount} 条`);
+      setStatus(`主屏生成中：${taskLabel(task)}，${mainCount} 条`);
       try {
         const nextPayload = await fetchPayload(task, mainCount, mainController);
         if (seq !== mainSeq) return;
@@ -616,7 +695,7 @@
         setStatus(statusFromPayload('主屏已更新', mainPayload), Boolean(mainPayload.cache?.error));
       } catch (err) {
         if (err.name === 'AbortError') return;
-        setStatus(`主屏刷新失败：${err}`, true);
+        setStatus(`主屏刷新失败：${errorText(err)}`, true);
       }
     }
 
@@ -625,7 +704,7 @@
       const task = taskSelect.value;
       if (recommendController) recommendController.abort();
       recommendController = new AbortController();
-      setStatus(`${advance ? '下一条' : '推荐加载'}中：${task}`);
+      setStatus(`${advance ? '下一条' : '推荐加载'}中：${taskLabel(task)}`);
       try {
         const nextPayload = await fetchRecommendation(task, advance, recommendController);
         if (seq !== recommendSeq) return;
@@ -634,19 +713,32 @@
         setStatus(statusFromPayload('推荐已更新', recommendPayload), Boolean(recommendPayload.cache?.error));
       } catch (err) {
         if (err.name === 'AbortError') return;
-        setStatus(`推荐刷新失败：${err}`, true);
+        setStatus(`推荐刷新失败：${errorText(err)}`, true);
       }
     }
 
     async function init() {
       const configRes = await fetch('/api/config');
       const config = await configRes.json();
-      mainCount = Math.max(1, Math.min(1000, Number(config.sample_count) || 100));
+      mainCount = Math.max(1, Number(config.sample_count) || 100);
+      if (config.recommend_live_stream_path) {
+        recommendLiveBackground.onload = () => {
+          recommendLiveReady = true;
+          recommendLiveBackground.classList.add('ready');
+          renderRecommend();
+        };
+        recommendLiveBackground.onerror = () => {
+          recommendLiveReady = false;
+          recommendLiveBackground.classList.remove('ready');
+          renderRecommend();
+        };
+        recommendLiveBackground.src = `${config.recommend_live_stream_path}?t=${Date.now()}`;
+      }
       const bgRes = await fetch('/api/background');
       const bg = await bgRes.json();
       background.onload = async () => {
         drawBackground(mainCtx);
-        drawBackground(recommendCtx);
+        clearRecommendationCanvas(recommendCtx);
         await refreshMain();
         await refreshRecommend();
         await pollCollectionEvents();
@@ -660,7 +752,7 @@
       await refreshMain();
       await refreshRecommend(false);
     };
-    init().catch(err => setStatus(`加载失败：${err}`, true));
+    init().catch(err => setStatus(`加载失败：${errorText(err)}`, true));
   </script>
 </body>
 </html>
