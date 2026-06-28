@@ -19,13 +19,13 @@ SAMPLE_CACHE="${SAMPLE_CACHE:-$SCRIPT_DIR/sampling_guidance_pair_cache.json}"
 PRECOMPUTE_COUNT="${PRECOMPUTE_COUNT:-100}"
 CENTRIFUGE_COLLECTION_DIR="${CENTRIFUGE_COLLECTION_DIR:-/home/astribot/Desktop/data/disk/trans/hdf5_output_centrifuge}"
 MULTIDROP_COLLECTION_DIR="${MULTIDROP_COLLECTION_DIR:-/home/astribot/Desktop/data/disk/trans/hdf5_output_multidrop}"
-COLLECTION_POSITION_TOLERANCE_M="${COLLECTION_POSITION_TOLERANCE_M:-0.03}"
+COLLECTION_POSITION_TOLERANCE_M="${COLLECTION_POSITION_TOLERANCE_M:-0.05}"
 COLLECTION_ROTATION_TOLERANCE_DEG="${COLLECTION_ROTATION_TOLERANCE_DEG:-20}"
-COLLECTION_SCAN_INTERVAL_S="${COLLECTION_SCAN_INTERVAL_S:-0.8}"
+COLLECTION_SCAN_INTERVAL_S="${COLLECTION_SCAN_INTERVAL_S:-0.1}"
 COLLECTION_FILE_STABLE_S="${COLLECTION_FILE_STABLE_S:-1.0}"
 COLLECTION_READ_TIMEOUT_S="${COLLECTION_READ_TIMEOUT_S:-10.0}"
-COLLECTION_FINAL_DESCENT_TOLERANCE_M="${COLLECTION_FINAL_DESCENT_TOLERANCE_M:-0.005}"
-COLLECTION_DESCENT_WINDOW_M="${COLLECTION_DESCENT_WINDOW_M:-0.01}"
+COLLECTION_FINAL_DESCENT_TOLERANCE_M="${COLLECTION_FINAL_DESCENT_TOLERANCE_M:-0.01}"
+COLLECTION_DESCENT_WINDOW_M="${COLLECTION_DESCENT_WINDOW_M:-0.005}"
 COLLECTION_GRIPPER_HALF_THRESHOLD="${COLLECTION_GRIPPER_HALF_THRESHOLD:-0.5}"
 COLLECTION_GRIPPER_HALF_CLOSE_MAX="${COLLECTION_GRIPPER_HALF_CLOSE_MAX:-1}"
 WORKSPACE_XY="${WORKSPACE_XY:-0.18,0.65,-0.45,0.20}"
@@ -37,6 +37,33 @@ OBJECT_WIDTH_CM="${OBJECT_WIDTH_CM:-8}"
 BLOCK_CORRIDOR_CM="${BLOCK_CORRIDOR_CM:-7}"
 MIN_TOOL_DIRECTION_DOT="${MIN_TOOL_DIRECTION_DOT:-0.0}"
 RIGHT_SHOULDER_XY="${RIGHT_SHOULDER_XY:-0.0,-0.22}"
+AUTO_DELETE_INVALID="${AUTO_DELETE_INVALID:-1}"
+
+# --- Stop any already-running sample-guidance instance before relaunching ---
+# Kill the python server first, then the launcher wrapper. Matching on the
+# server script path avoids killing this very script (which only contains the
+# path as a literal in the exec line below, not as a running python process).
+pkill -f "sampling_guidance_server.py" 2>/dev/null || true
+# Give it a moment to release port ${PORT} and close files.
+for _ in $(seq 1 20); do
+  if ! pgrep -f "sampling_guidance_server.py" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+# If still alive, escalate to SIGKILL.
+if pgrep -f "sampling_guidance_server.py" >/dev/null 2>&1; then
+  pkill -9 -f "sampling_guidance_server.py" 2>/dev/null || true
+  sleep 0.5
+fi
+# Best-effort: free the TCP port in case some other process is holding it.
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${PORT}/tcp" 2>/dev/null || true
+elif command -v ss >/dev/null 2>&1; then
+  pid_on_port=$(ss -ltnp 2>/dev/null | awk -v p=":${PORT}" '$4 ~ p {match($0,/pid=([0-9]+)/,a); print a[1]}' | head -n1)
+  [[ -n "${pid_on_port}" ]] && kill "${pid_on_port}" 2>/dev/null || true
+fi
+sleep 0.3
 
 if [[ "$RECOMMEND_LIVE_STREAM_AUTOSTART" == "1" && "$RECOMMEND_LIVE_STREAM_URL" == "http://127.0.0.1:8088/stream.mjpg" ]]; then
   if ! $HOME/miniforge3/envs/sampling-guidance/bin/python - <<'PY'
@@ -92,4 +119,6 @@ $HOME/miniforge3/envs/sampling-guidance/bin/python "$SCRIPT_DIR/sampling_guidanc
   --object-width-cm "$OBJECT_WIDTH_CM" \
   --block-corridor-cm "$BLOCK_CORRIDOR_CM" \
   --min-tool-direction-dot "$MIN_TOOL_DIRECTION_DOT" \
-  --right-shoulder-xy "$RIGHT_SHOULDER_XY"
+  --right-shoulder-xy "$RIGHT_SHOULDER_XY" \
+  --delete-raw-on-invalid \
+  $([[ "$AUTO_DELETE_INVALID" == "1" ]] && echo --auto-delete-invalid || echo --no-auto-delete-invalid)

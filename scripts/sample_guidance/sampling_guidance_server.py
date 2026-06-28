@@ -11,6 +11,7 @@ import math
 import mimetypes
 import random
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -79,6 +80,13 @@ FIXED_DATASET_JOINT_NAMES = {
     24: "astribot_head_joint_2",
 }
 RIGHT_ARM_EE_OFFSET_TOOL = np.asarray([0.0, -0.15, 0.0], dtype=float)
+
+# Tolerance for the human-collection place-height sanity check. The centrifuge
+# and multidrop place heights are ~7.7cm apart, so 3cm cleanly separates a
+# correct task from a forgotten frontend task switch without flagging normal
+# descent variation.
+PLACE_HEIGHT_MISMATCH_TOLERANCE_M = 0.03
+TASK_LABELS_CN = {"centrifuge": "离心机", "multidrop": "分液器"}
 
 
 @dataclass(frozen=True)
@@ -170,6 +178,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--multidrop-place-height", type=float, default=DEFAULT_MULTIDROP_PLACE_HEIGHT_M)
     parser.add_argument("--ik-position-tolerance", type=float, default=0.01)
     parser.add_argument("--ik-rotation-tolerance-deg", type=float, default=5.0)
+    parser.add_argument(
+        "--ik-joint-limit-margin-fraction",
+        type=float,
+        default=0.02,
+        help="Reject IK solutions where any joint is within this fraction of its "
+        "limits (0 disables; 0.02 = 2%% safety margin). PyBullet IK limits are "
+        "hints, not hard constraints, so solutions at/beyond limits are physically "
+        "unreachable.",
+    )
     parser.add_argument("--orientation-neighbors", type=int, default=24)
     parser.add_argument("--object-length-cm", type=float, default=13.0)
     parser.add_argument("--object-width-cm", type=float, default=8.0)
@@ -198,6 +215,30 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--direction-axis", choices=["+x", "-x", "+y", "-y", "+z", "-z"], default="-y")
     parser.add_argument("--direction-mode", choices=["column", "row"], default="column")
+    parser.add_argument(
+        "--delete-raw-on-invalid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When a collected HDF5 is deleted as invalid, also delete the matching "
+            "raw episode_abs_<N>.hdf5 in the sibling raw dir and refresh task_info.json. "
+            "The raw dir is derived as <collection_dir>.parent.parent / "
+            "<collection_dir>.name with 'hdf5_output_' stripped."
+        ),
+    )
+    parser.add_argument(
+        "--auto-delete-invalid",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When a newly scanned collection file fails validation (position/rotation "
+            "mismatch, missing keyposes, unreachable match, or the matched sample is "
+            "already occupied), delete the HDF5 immediately instead of keeping it for "
+            "manual review. A review PNG is still rendered next to the file path before "
+            "deletion so the UI can show why it was rejected. The matching raw "
+            "episode_abs_<N>.hdf5 is also removed when --delete-raw-on-invalid is set."
+        ),
+    )
     return parser
 
 
@@ -320,6 +361,29 @@ def quat_error_deg(actual_xyzw: np.ndarray, expected_xyzw: np.ndarray) -> float:
     actual = np.asarray(actual_xyzw, dtype=float).reshape(4)
     expected = np.asarray(expected_xyzw, dtype=float).reshape(4)
     return float(math.degrees((Rotation.from_quat(actual).inv() * Rotation.from_quat(expected)).magnitude()))
+
+
+def direction_angle_error_deg(
+    actual_pose: np.ndarray,
+    expected_pose: np.ndarray,
+    direction_axis: str,
+    direction_mode: str,
+) -> float | None:
+    """Angle between the XY-projected tool directions of two poses (degrees).
+
+    Mirrors the arrow drawn on the review bboxes: take the configured tool axis,
+    project it onto the world XY plane for both poses, and return the absolute
+    angle between the two directed arrows. Returns None when either projection
+    is degenerate (tool axis nearly perpendicular to the table).
+    """
+    adx, ady = direction_from_pose(actual_pose, direction_axis, direction_mode)
+    edx, edy = direction_from_pose(expected_pose, direction_axis, direction_mode)
+    if adx is None or edx is None:
+        return None
+    delta = math.atan2(ady, adx) - math.atan2(edy, edx)
+    # wrap to (-pi, pi]
+    delta = (delta + math.pi) % (2.0 * math.pi) - math.pi
+    return abs(math.degrees(delta))
 
 
 def prepare_gripper_values(raw_gripper: np.ndarray, invert_gripper_value: bool) -> np.ndarray:
@@ -679,6 +743,7 @@ class IKReachability:
         alignment: Path,
         position_tolerance: float,
         rotation_tolerance_deg: float,
+        joint_limit_margin_fraction: float = 0.0,
     ) -> None:
         data = json.loads(alignment.read_text(encoding="utf-8"))
         transform = data["transform_data_from_urdf"]
@@ -687,6 +752,7 @@ class IKReachability:
         self.q_data_from_urdf = Rotation.from_quat(transform["rotation_quat_xyzw"])
         self.position_tolerance = position_tolerance
         self.rotation_tolerance_rad = math.radians(rotation_tolerance_deg)
+        self.joint_limit_margin_fraction = max(0.0, float(joint_limit_margin_fraction))
         self.client = pb.connect(pb.DIRECT)
         self.fixed_dataset_joint_values = {
             FIXED_DATASET_JOINT_NAMES[col]: value
@@ -814,6 +880,15 @@ class IKReachability:
                 min_margin_rad = margin_rad
                 min_margin_fraction = margin_fraction
                 min_margin_joint = name
+        # Reject solutions at/beyond joint limits — PyBullet's lowerLimits/upperLimits
+        # are null-space hints, not hard constraints, so IK can return a
+        # configuration the physical robot cannot realize even when the EE
+        # position error is within tolerance.
+        if (
+            self.joint_limit_margin_fraction > 0.0
+            and min_margin_fraction < self.joint_limit_margin_fraction
+        ):
+            return None
         return {
             "position_error_m": pos_error,
             "rotation_error_deg": math.degrees(rot_error),
@@ -848,6 +923,7 @@ class SamplingState:
         place_heights: dict[str, float],
         ik_position_tolerance: float,
         ik_rotation_tolerance_deg: float,
+        ik_joint_limit_margin_fraction: float,
         collection_dirs: dict[str, Path],
         collection_position_tolerance_m: float,
         collection_rotation_tolerance_deg: float,
@@ -873,6 +949,8 @@ class SamplingState:
         invert_gripper_value: bool,
         direction_axis: str,
         direction_mode: str,
+        delete_raw_on_invalid: bool = True,
+        auto_delete_invalid: bool = False,
     ) -> None:
         self.input_dir = input_dir
         self.model_path = model_path
@@ -896,7 +974,9 @@ class SamplingState:
             alignment=alignment,
             position_tolerance=ik_position_tolerance,
             rotation_tolerance_deg=ik_rotation_tolerance_deg,
+            joint_limit_margin_fraction=ik_joint_limit_margin_fraction,
         )
+        self.ik_joint_limit_margin_fraction = ik_joint_limit_margin_fraction
         self.orientation_neighbors = orientation_neighbors
         self.collection_dirs = collection_dirs
         self.collection_position_tolerance_m = max(0.0, float(collection_position_tolerance_m))
@@ -922,6 +1002,8 @@ class SamplingState:
         self.invert_gripper_value = invert_gripper_value
         self.direction_axis = direction_axis
         self.direction_mode = direction_mode
+        self.delete_raw_on_invalid = delete_raw_on_invalid
+        self.auto_delete_invalid = auto_delete_invalid
         self.model = load_model(model_path)
         self.file_cache: dict[str, dict[str, object]] = {}
         self.lock = threading.Lock()
@@ -1005,9 +1087,9 @@ class SamplingState:
                 try:
                     analysis = self.extract_episode_analysis(path)
                 except Exception as exc:
-                    self._reject_and_delete(
+                    self._reject_for_review(
                         task, path, -1, None,
-                        [f"启动校对：文件读取失败 {type(exc).__name__}: {exc}"], {}, {},
+                        [f"启动校对：文件读取失败 {type(exc).__name__}: {exc}"], {}, None,
                     )
                     continue
                 with self.pool_condition:
@@ -1091,10 +1173,34 @@ class SamplingState:
             if not (np.all(np.isfinite(actual_pos)) and np.all(np.isfinite(actual_quat))
                     and np.all(np.isfinite(expected_pos)) and np.all(np.isfinite(expected_quat))):
                 return False
-            if float(np.linalg.norm(actual_pos - expected_pos)) >= self.collection_position_tolerance_m:
+            # Compare OBJECT positions (tool + rotation @ shared_tool_frame offset)
+            # to stay consistent with the review overlay / recommendation window,
+            # which draw boxes at the object position the operator aligns to.
+            expected_rot = rotation_matrix_from_xyzw(expected_quat)
+            actual_rot = rotation_matrix_from_xyzw(actual_quat)
+            if not (np.all(np.isfinite(expected_rot)) and np.all(np.isfinite(actual_rot))):
+                return False
+            expected_object = apply_model_offset(self.model, expected_pos, expected_rot)
+            actual_object = apply_model_offset(self.model, actual_pos, actual_rot)
+            # XOY-plane (horizontal) error only, to stay consistent with the
+            # review metric (Z is invisible in the top-down overlay).
+            delta_xy = actual_object[:2] - expected_object[:2]
+            if float(np.linalg.norm(delta_xy)) >= self.collection_position_tolerance_m:
                 return False
             try:
-                if quat_error_deg(actual_quat, expected_quat) >= self.collection_rotation_tolerance_deg:
+                expected_pose = np.asarray([*expected_pos, *expected_quat], dtype=float)
+                actual_pose = np.asarray(actual[:7], dtype=float)
+                direction_error = direction_angle_error_deg(
+                    actual_pose,
+                    expected_pose,
+                    self.direction_axis,
+                    self.direction_mode,
+                )
+                if direction_error is not None:
+                    rotation_error = direction_error
+                else:
+                    rotation_error = quat_error_deg(actual_quat, expected_quat)
+                if rotation_error >= self.collection_rotation_tolerance_deg:
                     return False
             except ValueError:
                 return False
@@ -1110,6 +1216,8 @@ class SamplingState:
             return None
         ag = np.asarray(ag[:3], dtype=float)
         ap = np.asarray(ap[:3], dtype=float)
+        agq = np.asarray(ag[3:7], dtype=float) if len(ag) >= 7 else None
+        apq = np.asarray(ap[3:7], dtype=float) if len(ap) >= 7 else None
         g = pair.get("grasp")
         p = pair.get("place")
         if not isinstance(g, dict) or not isinstance(p, dict):
@@ -1117,12 +1225,32 @@ class SamplingState:
         try:
             eg = np.asarray([g["tool_x"], g["tool_y"], g["tool_z"]], dtype=float)
             ep = np.asarray([p["tool_x"], p["tool_y"], p["tool_z"]], dtype=float)
+            egq = np.asarray([g["qx"], g["qy"], g["qz"], g["qw"]], dtype=float)
+            epq = np.asarray([p["qx"], p["qy"], p["qz"], p["qw"]], dtype=float)
         except (KeyError, TypeError):
             return None
         if not (np.all(np.isfinite(ag)) and np.all(np.isfinite(ap))
                 and np.all(np.isfinite(eg)) and np.all(np.isfinite(ep))):
             return None
-        return float(np.linalg.norm(ag - eg) + np.linalg.norm(ap - ep))
+        # Distance on OBJECT positions (tool + rotation @ offset), consistent
+        # with the validation and display.
+        ag_obj = ag
+        ap_obj = ap
+        if agq is not None and np.all(np.isfinite(agq)):
+            ag_rot = rotation_matrix_from_xyzw(agq)
+            if np.all(np.isfinite(ag_rot)):
+                ag_obj = apply_model_offset(self.model, ag, ag_rot)
+        if apq is not None and np.all(np.isfinite(apq)):
+            ap_rot = rotation_matrix_from_xyzw(apq)
+            if np.all(np.isfinite(ap_rot)):
+                ap_obj = apply_model_offset(self.model, ap, ap_rot)
+        eg_rot = rotation_matrix_from_xyzw(egq)
+        ep_rot = rotation_matrix_from_xyzw(epq)
+        if not (np.all(np.isfinite(eg_rot)) and np.all(np.isfinite(ep_rot))):
+            return None
+        eg_obj = apply_model_offset(self.model, eg, eg_rot)
+        ep_obj = apply_model_offset(self.model, ep, ep_rot)
+        return float(np.linalg.norm(ag_obj - eg_obj) + np.linalg.norm(ap_obj - ep_obj))
 
     def push_collection_event(self, event: dict[str, object]) -> None:
         with self.collection_lock:
@@ -1322,8 +1450,25 @@ class SamplingState:
             return None
         ag = np.asarray(actual_grasp[:3], dtype=float)
         ap = np.asarray(actual_place[:3], dtype=float)
-        if not (np.all(np.isfinite(ag)) and np.all(np.isfinite(ap))):
+        agq = np.asarray(actual_grasp[3:7], dtype=float)
+        apq = np.asarray(actual_place[3:7], dtype=float)
+        if not (
+            np.all(np.isfinite(ag))
+            and np.all(np.isfinite(ap))
+            and np.all(np.isfinite(agq))
+            and np.all(np.isfinite(apq))
+        ):
             return None
+        # Match on OBJECT positions (tool + rotation @ shared_tool_frame offset),
+        # consistent with the review overlay and the pass/fail validation. Matching
+        # on raw tool_joint positions would be skewed by the rotating offset
+        # projection and could pair a collection with the wrong sample.
+        ag_rot = rotation_matrix_from_xyzw(agq)
+        ap_rot = rotation_matrix_from_xyzw(apq)
+        if not (np.all(np.isfinite(ag_rot)) and np.all(np.isfinite(ap_rot))):
+            return None
+        ag_obj = apply_model_offset(self.model, ag, ag_rot)
+        ap_obj = apply_model_offset(self.model, ap, ap_rot)
         best_index = -1
         best_pair: dict[str, object] | None = None
         best_dist = float("inf")
@@ -1337,11 +1482,20 @@ class SamplingState:
             try:
                 eg = np.asarray([g["tool_x"], g["tool_y"], g["tool_z"]], dtype=float)
                 ep = np.asarray([p["tool_x"], p["tool_y"], p["tool_z"]], dtype=float)
+                egq = np.asarray([g["qx"], g["qy"], g["qz"], g["qw"]], dtype=float)
+                epq = np.asarray([p["qx"], p["qy"], p["qz"], p["qw"]], dtype=float)
             except (KeyError, TypeError):
                 continue
-            if not (np.all(np.isfinite(eg)) and np.all(np.isfinite(ep))):
+            if not (np.all(np.isfinite(eg)) and np.all(np.isfinite(ep))
+                    and np.all(np.isfinite(egq)) and np.all(np.isfinite(epq))):
                 continue
-            dist = float(np.linalg.norm(ag - eg) + np.linalg.norm(ap - ep))
+            eg_rot = rotation_matrix_from_xyzw(egq)
+            ep_rot = rotation_matrix_from_xyzw(epq)
+            if not (np.all(np.isfinite(eg_rot)) and np.all(np.isfinite(ep_rot))):
+                continue
+            eg_obj = apply_model_offset(self.model, eg, eg_rot)
+            ep_obj = apply_model_offset(self.model, ep, ep_rot)
+            dist = float(np.linalg.norm(ag_obj - eg_obj) + np.linalg.norm(ap_obj - ep_obj))
             if dist < best_dist:
                 best_dist = dist
                 best_index = int(pair.get("index", -1))
@@ -1400,9 +1554,30 @@ class SamplingState:
                 reasons.append(f"{keypose} pose 含无效数值")
                 metrics[keypose] = {"invalid": True}
                 continue
-            position_error_m = float(np.linalg.norm(actual_pos - expected_pos))
+            # Compare OBJECT positions (tool + rotation @ shared_tool_frame offset),
+            # not raw tool_joint positions. The review overlay and recommendation
+            # window draw boxes at the object position, which is what the operator
+            # aligns to. Comparing tool_joint positions instead would surface the
+            # rotating offset projection (~12cm) as a spurious XY error that
+            # doesn't match what the operator sees.
+            expected_rot = rotation_matrix_from_xyzw(expected_quat)
+            actual_rot = rotation_matrix_from_xyzw(actual_quat)
+            if not (np.all(np.isfinite(expected_rot)) and np.all(np.isfinite(actual_rot))):
+                reasons.append(f"{keypose} 旋转矩阵无效")
+                metrics[keypose] = {"invalid": True}
+                continue
+            expected_object = apply_model_offset(self.model, expected_pos, expected_rot)
+            actual_object = apply_model_offset(self.model, actual_pos, actual_rot)
+            # XOY-plane (horizontal) error only: the review overlay projects
+            # object positions onto the camera image, so Z discrepancies are not
+            # visible to the operator. Match the displayed geometry by ignoring
+            # the Z component in the pass/fail position metric.
+            delta_xy = actual_object[:2] - expected_object[:2]
+            position_error_m = float(np.linalg.norm(delta_xy))
+            expected_pose = np.asarray([*expected_pos, *expected_quat], dtype=float)
+            actual_pose = np.asarray(actual[:7], dtype=float)
             try:
-                rotation_error_deg = quat_error_deg(actual_quat, expected_quat)
+                rotation_error_3d_deg = quat_error_deg(actual_quat, expected_quat)
             except ValueError:
                 reasons.append(f"{keypose} 四元数无效")
                 metrics[keypose] = {
@@ -1410,13 +1585,28 @@ class SamplingState:
                     "invalid_rotation": True,
                 }
                 continue
+            direction_error = direction_angle_error_deg(
+                actual_pose,
+                expected_pose,
+                self.direction_axis,
+                self.direction_mode,
+            )
+            # Use the in-plane tool-direction angle (the arrow shown on the
+            # review bboxes) as the pass/fail metric; fall back to the full 3D
+            # quaternion error only when the projected direction is degenerate.
+            if direction_error is not None:
+                rotation_error_deg = direction_error
+            else:
+                rotation_error_deg = rotation_error_3d_deg
             metrics[keypose] = {
                 "position_error_m": position_error_m,
                 "rotation_error_deg": rotation_error_deg,
+                "rotation_error_3d_deg": rotation_error_3d_deg,
+                "rotation_error_direction_deg": direction_error,
             }
             if position_error_m >= self.collection_position_tolerance_m:
                 reasons.append(
-                    f"{keypose} 位置误差 {position_error_m * 100:.1f}cm >= "
+                    f"{keypose} 位置误差(XY) {position_error_m * 100:.1f}cm >= "
                     f"{self.collection_position_tolerance_m * 100:.1f}cm"
                 )
             if rotation_error_deg >= self.collection_rotation_tolerance_deg:
@@ -1445,22 +1635,134 @@ class SamplingState:
             )
         return not reasons, reasons, metrics
 
+    def build_actual_keypose_record(
+        self, task: str, keypose: str, pose: np.ndarray
+    ) -> dict[str, object] | None:
+        """Project an actually-collected tool pose into the cache record format."""
+        tool_point = np.asarray(pose[:3], dtype=float)
+        quat = np.asarray(pose[3:7], dtype=float)
+        if not (np.all(np.isfinite(tool_point)) and np.all(np.isfinite(quat))):
+            return None
+        rotation = rotation_matrix_from_xyzw(quat)
+        if not np.all(np.isfinite(rotation)):
+            return None
+        object_point = apply_model_offset(self.model, tool_point, rotation)
+        display_z = float(object_point[2])
+        display_point = np.asarray([object_point[0], object_point[1], display_z], dtype=float)
+        u, v = project_world_point(display_point, self.model)
+        if u is None or v is None:
+            return None
+        dx, dy = direction_from_pose(
+            np.asarray([*tool_point, *quat], dtype=float), self.direction_axis, self.direction_mode
+        )
+        direction_u = None
+        direction_v = None
+        if dx is not None and dy is not None:
+            end_uv, end_depth = project_points(
+                (display_point + np.asarray([dx, dy, 0.0], dtype=float) * 0.04).reshape(1, 3),
+                self.model,
+            )
+            if end_depth[0] > 0:
+                direction_u = float(end_uv[0, 0] - u)
+                direction_v = float(end_uv[0, 1] - v)
+        box = project_oriented_box(
+            display_point, (dx, dy), self.object_length_m, self.object_width_m, self.model
+        )
+        return {
+            "task": task,
+            "keypose": keypose,
+            "x": float(u),
+            "y": float(v),
+            "world_x": float(display_point[0]),
+            "world_y": float(display_point[1]),
+            "world_z": float(display_point[2]),
+            "actual_world_z": float(tool_point[2]),
+            "tool_x": float(tool_point[0]),
+            "tool_y": float(tool_point[1]),
+            "tool_z": float(tool_point[2]),
+            "qx": float(quat[0]),
+            "qy": float(quat[1]),
+            "qz": float(quat[2]),
+            "qw": float(quat[3]),
+            "direction_u": direction_u,
+            "direction_v": direction_v,
+            **box_payload_fields(box),
+            "tool_direction_xy": [dx, dy],
+        }
+
+    def _place_height_mismatch_warning(self, task: str, analysis: dict[str, object]) -> str | None:
+        """Warn if the collected place Z doesn't match the configured task.
+
+        The place keypose is detected at the bottom of the final descent, so its
+        Z is the lowest point of the place motion. The configured
+        ``place_heights[task]`` is the *object* height, while the collected
+        keypose is the *tool* pose, so the rotating ``shared_tool_frame`` offset
+        must be applied before comparing. If that object Z is far from the
+        theoretical place height — and especially if it is closer to the other
+        task's place height — the operator most likely forgot to switch the
+        frontend centrifuge/multidrop toggle before collecting.
+        """
+        keyposes = analysis.get("keyposes", {})
+        place_pose = keyposes.get("place")
+        if place_pose is None:
+            return None
+        try:
+            pose = np.asarray(place_pose, dtype=float)
+            tool_point = pose[:3]
+            quat = pose[3:7]
+        except (IndexError, TypeError, ValueError, FloatingPointError):
+            return None
+        if tool_point.shape[0] < 3 or quat.shape[0] < 4:
+            return None
+        if not (np.all(np.isfinite(tool_point)) and np.all(np.isfinite(quat))):
+            return None
+        rotation = rotation_matrix_from_xyzw(quat)
+        if not np.all(np.isfinite(rotation)):
+            return None
+        object_point = apply_model_offset(self.model, tool_point, rotation)
+        actual_z = float(object_point[2])
+        if not np.isfinite(actual_z):
+            return None
+        expected_z = float(self.place_heights[task])
+        this_label = TASK_LABELS_CN.get(task, task)
+        if abs(actual_z - expected_z) <= PLACE_HEIGHT_MISMATCH_TOLERANCE_M:
+            return None
+        # Find the other task to see if the operator did the wrong task.
+        other_task = next((t for t in TASKS if t != task), None)
+        other_z = float(self.place_heights[other_task]) if other_task else None
+        other_label = TASK_LABELS_CN.get(other_task, other_task) if other_task else None
+        if (
+            other_z is not None
+            and abs(actual_z - other_z) < abs(actual_z - expected_z)
+        ):
+            return (
+                f"放置高度 {actual_z * 100:.2f}cm 更接近 {other_label}"
+                f"（{other_z * 100:.2f}cm）而非 {this_label}（{expected_z * 100:.2f}cm），"
+                f"请确认前端任务切换正确"
+            )
+        return (
+            f"放置高度 {actual_z * 100:.2f}cm 偏离 {this_label} 理论高度 "
+            f"{expected_z * 100:.2f}cm 超过 {PLACE_HEIGHT_MISMATCH_TOLERANCE_M * 100:.1f}cm"
+        )
+
     def process_collection_file(self, task: str, path: Path, pending: dict[str, object]) -> bool:
         """Validate a new collection file. Returns True if handled (accepted/deleted), False if it should retry."""
         try:
             analysis = self.extract_episode_analysis(path)
         except Exception as exc:
-            self._reject_and_delete(task, path, -1, None, [f"文件读取或解析失败：{type(exc).__name__}: {exc}"], {}, {})
+            self._reject_for_review(task, path, -1, None, [f"文件读取或解析失败：{type(exc).__name__}: {exc}"], {}, None)
             return True
         keyposes = analysis.get("keyposes", {})
         frames = analysis.get("frame_values", {})
         if keyposes.get("grasp") is None or keyposes.get("place") is None:
-            self._reject_and_delete(
+            self._reject_for_review(
                 task, path, -1, None,
                 ["未检测到 grasp/place 关键帧（夹爪闭合段或下降段缺失）"],
-                {}, frames,
+                {}, analysis,
             )
             return True
+        place_warning = self._place_height_mismatch_warning(task, analysis)
+        warnings = [place_warning] if place_warning else []
         # Match to the nearest uncollected sample point in the pool.
         with self.pool_condition:
             reference = self.find_nearest_uncollected_pair_unlocked(task, analysis)
@@ -1474,6 +1776,7 @@ class SamplingState:
                     "pair_index": -1,
                     "message": "暂无未采集的采样点可匹配，稍后重试",
                     "reasons": ["无可匹配采样点"],
+                    "warnings": warnings,
                     "deleted": False,
                     "advance": False,
                 }
@@ -1495,13 +1798,49 @@ class SamplingState:
                         cached_pair = candidate
                         break
                 if cached_pair is not None:
+                    actual_grasp = self.build_actual_keypose_record(task, "grasp", keyposes["grasp"])
+                    actual_place = self.build_actual_keypose_record(task, "place", keyposes["place"])
                     cached_pair["collected"] = True
                     cached_pair["source_file"] = str(path.resolve())
+                    if actual_grasp is not None:
+                        cached_pair["grasp"] = actual_grasp
+                    if actual_place is not None:
+                        cached_pair["place"] = actual_place
                     self.save_sample_cache_unlocked()
                     completed = True
                 if completed:
                     self.pool_condition.notify_all()
             if not completed:
+                review_image = self.render_review_image(
+                    task, path, analysis, pair, ["匹配采样点已被占用"], metrics, status="rejected"
+                )
+                if self.auto_delete_invalid:
+                    delete_result = self.delete_collection_file(str(path))
+                    deleted = bool(delete_result.get("ok"))
+                    message = (
+                        "采集姿态有效，但匹配的采样点已被占用，已自动删除文件"
+                        if deleted
+                        else "采集姿态有效，但匹配的采样点已被占用，自动删除失败，文件保留且未计完成"
+                    )
+                    self.push_collection_event(
+                        {
+                            "task": task,
+                            "status": "rejected",
+                            "file": str(path),
+                            "pair_index": pair.get("index", pair_index),
+                            "message": message,
+                            "reasons": ["匹配采样点已被占用"],
+                            "warnings": warnings,
+                            "metrics": metrics,
+                            "frames": frames,
+                            "deleted": deleted,
+                            "advance": False,
+                            "pending_review": not deleted,
+                            "overlay": self._build_review_overlay(task, analysis, pair),
+                            "review_image": review_image,
+                        }
+                    )
+                    return True
                 self.push_collection_event(
                     {
                         "task": task,
@@ -1510,13 +1849,20 @@ class SamplingState:
                         "pair_index": pair.get("index", pair_index),
                         "message": "采集姿态有效，但匹配的采样点已被占用，文件保留且未计完成",
                         "reasons": ["匹配采样点已被占用"],
+                        "warnings": warnings,
                         "metrics": metrics,
                         "frames": frames,
                         "deleted": False,
                         "advance": False,
+                        "pending_review": True,
+                        "overlay": self._build_review_overlay(task, analysis, pair),
+                        "review_image": review_image,
                     }
                 )
                 return True
+            review_image = self.render_review_image(
+                task, path, analysis, pair, [], metrics, status="accepted"
+            )
             self.push_collection_event(
                 {
                     "task": task,
@@ -1524,16 +1870,52 @@ class SamplingState:
                     "file": str(path),
                     "pair_index": pair.get("index", pair_index),
                     "message": "采集有效，已匹配并完成最近采样点",
+                    "warnings": warnings,
                     "metrics": metrics,
                     "frames": frames,
                     "advance": True,
+                    "overlay": self._build_review_overlay(task, analysis, pair),
+                    "review_image": review_image,
                 }
             )
+            self._dedup_duplicate_collections(
+                task, pair.get("index", pair_index), str(path), force_keep_current=True
+            )
             return True
-        self._reject_and_delete(task, path, pair.get("index", pair_index), pair, reasons, metrics, frames)
+        self._reject_for_review(task, path, pair.get("index", pair_index), pair, reasons, metrics, analysis, warnings=warnings)
         return True
 
-    def _reject_and_delete(
+    def _build_review_overlay(
+        self,
+        task: str,
+        analysis: dict[str, object] | None,
+        pair: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Project the actually-collected grasp/place keyposes + the matched reference pair.
+
+        Each side is returned in the same record format the UI uses to draw an
+        oriented bbox (x, y, box_px, direction_u/v, keypose), so the reviewer can
+        overlay them on the live camera view.
+        """
+        if not analysis or not isinstance(pair, dict):
+            return None
+        keyposes = analysis.get("keyposes", {})
+        ag = keyposes.get("grasp")
+        ap = keyposes.get("place")
+        actual_grasp = self.build_actual_keypose_record(task, "grasp", ag) if ag is not None else None
+        actual_place = self.build_actual_keypose_record(task, "place", ap) if ap is not None else None
+        ref_grasp = pair.get("grasp") if isinstance(pair.get("grasp"), dict) else None
+        ref_place = pair.get("place") if isinstance(pair.get("place"), dict) else None
+        if actual_grasp is None and actual_place is None and ref_grasp is None and ref_place is None:
+            return None
+        return {
+            "actual_grasp": actual_grasp,
+            "actual_place": actual_place,
+            "reference_grasp": ref_grasp,
+            "reference_place": ref_place,
+        }
+
+    def _reject_for_review(
         self,
         task: str,
         path: Path,
@@ -1541,32 +1923,431 @@ class SamplingState:
         pair: dict[str, object] | None,
         reasons: list[str],
         metrics: dict[str, object],
-        frames: dict[str, int],
+        analysis: dict[str, object] | None,
+        warnings: list[str] | None = None,
     ) -> None:
-        deleted = False
-        delete_error = None
-        try:
-            path.unlink()
-            deleted = True
-        except FileNotFoundError:
-            deleted = True
-        except Exception as exc:
-            delete_error = f"{type(exc).__name__}: {exc}"
-        message = "采集无效，文件已删除" if deleted else f"采集无效，删除失败：{delete_error}"
+        """Reject a collection file. When ``auto_delete_invalid`` is set the file
+        is deleted immediately (a review PNG is rendered first so the UI can still
+        show why it was rejected); otherwise it is kept on disk for manual review.
+
+        The kept-on-disk branch registers the file as a known file so it is not
+        reprocessed on every scan. A review overlay (actual vs reference grasp/
+        place projected bboxes) is attached to the event so the UI can render the
+        comparison before the user decides to delete or keep it.
+        """
+        frames = analysis.get("frame_values", {}) if analysis else {}
+        overlay = self._build_review_overlay(task, analysis, pair)
+        review_image = self.render_review_image(task, path, analysis, pair, reasons, metrics, status="rejected")
+        pair_idx_resolved = pair.get("index", pair_index) if pair else pair_index
+        if self.auto_delete_invalid:
+            delete_result = self.delete_collection_file(str(path))
+            deleted = bool(delete_result.get("ok"))
+            message = (
+                "采集未通过校验，已自动删除文件"
+                if deleted
+                else "采集未通过校验，自动删除失败，文件保留待人工复核"
+            )
+            self.push_collection_event(
+                {
+                    "task": task,
+                    "status": "rejected",
+                    "file": str(path),
+                    "pair_index": pair_idx_resolved,
+                    "message": message,
+                    "reasons": reasons,
+                    "warnings": list(warnings) if warnings else [],
+                    "metrics": metrics,
+                    "frames": frames,
+                    "deleted": deleted,
+                    "advance": False,
+                    "pending_review": not deleted,
+                    "overlay": overlay,
+                    "review_image": review_image,
+                }
+            )
+            if deleted:
+                return
+            # deletion failed -> fall through to the keep-for-review path
+        message = "采集未通过校验，文件已保留待人工复核"
         self.push_collection_event(
             {
                 "task": task,
                 "status": "rejected",
                 "file": str(path),
-                "pair_index": pair.get("index", pair_index) if pair else pair_index,
+                "pair_index": pair_idx_resolved,
                 "message": message,
                 "reasons": reasons,
+                "warnings": list(warnings) if warnings else [],
                 "metrics": metrics,
                 "frames": frames,
-                "deleted": deleted,
+                "deleted": False,
                 "advance": False,
+                "pending_review": True,
+                "overlay": overlay,
+                "review_image": review_image,
             }
         )
+        self._dedup_duplicate_collections(
+            task,
+            pair_idx_resolved,
+            str(path),
+            force_keep_current=False,
+        )
+
+    def delete_collection_file(self, file_path: str) -> dict[str, object]:
+        """Delete a kept collection file after manual review.
+
+        Only files that live inside one of the configured collection directories
+        may be removed, to avoid path-traversal writes outside them. When
+        ``delete_raw_on_invalid`` is set, the matching raw ``episode_abs_<N>``
+        file in the sibling raw data dir is also removed and ``task_info.json``
+        is refreshed so the recorded Count reflects the surviving raw files.
+
+        Any pending-review events in the in-memory buffer that reference this
+        file are marked resolved (``deleted=True, pending_review=False``) so a
+        page refresh does not re-trigger the review dialog.
+        """
+        if not file_path:
+            return {"ok": False, "error": "未提供文件路径"}
+        target = Path(file_path).resolve()
+        allowed_roots = [Path(self.collection_dirs[task]).resolve() for task in TASKS]
+        owner_task: str | None = None
+        for task in TASKS:
+            root = Path(self.collection_dirs[task]).resolve()
+            if target == root or root in target.parents:
+                owner_task = task
+                break
+        if owner_task is None:
+            return {"ok": False, "error": "文件不在采集目录内，已拒绝"}
+        key = str(target)
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            return {"ok": False, "error": f"删除失败：{type(exc).__name__}: {exc}"}
+        with self.collection_lock:
+            for task in TASKS:
+                self.collection_known_files[task].discard(key)
+                self.collection_pending_files[task].pop(key, None)
+        self._resolve_pending_review_events(str(target), deleted=True, message="已手动删除采集文件")
+        raw_removed: str | None = None
+        if self.delete_raw_on_invalid:
+            raw_removed = self._delete_raw_and_refresh_task_info(owner_task, target)
+        result: dict[str, object] = {"ok": True, "file": str(target)}
+        if raw_removed:
+            result["raw_file"] = raw_removed
+        return result
+
+    def keep_collection_file(self, file_path: str) -> dict[str, object]:
+        """Acknowledge a pending-review file as kept (no deletion).
+
+        Marks any pending-review events in the in-memory buffer that reference
+        this file as resolved (``pending_review=False``) so a page refresh does
+        not re-trigger the review dialog. The file itself is left untouched.
+        """
+        if not file_path:
+            return {"ok": False, "error": "未提供文件路径"}
+        target = Path(file_path).resolve()
+        allowed_roots = [Path(self.collection_dirs[task]).resolve() for task in TASKS]
+        if not any(target == root or root in target.parents for root in allowed_roots):
+            return {"ok": False, "error": "文件不在采集目录内，已拒绝"}
+        self._resolve_pending_review_events(str(target), deleted=False, message="已保留采集文件")
+        return {"ok": True, "file": str(target)}
+
+    def _resolve_pending_review_events(
+        self, file_path: str, deleted: bool, message: str
+    ) -> int:
+        """Mark pending-review events referencing ``file_path`` as resolved.
+
+        Mutates matching events in the in-memory ``collection_events`` buffer so
+        that a page refresh (which replays the buffer from ``after=0``) does not
+        re-trigger the review dialog. Returns the number of events resolved.
+        """
+        resolved = 0
+        with self.collection_lock:
+            for event in self.collection_events:
+                if (
+                    event.get("file") == file_path
+                    and bool(event.get("pending_review", False))
+                ):
+                    event["pending_review"] = False
+                    event["deleted"] = bool(deleted)
+                    event["message"] = message
+                    resolved += 1
+        return resolved
+
+    def _raw_data_dir_for(self, task: str) -> Path | None:
+        """Sibling raw data dir for a task's collection dir.
+
+        For ``<root>/trans/hdf5_output_<task>`` this returns ``<root>/<task>``
+        (i.e. go up two levels from the collection dir and drop the
+        ``hdf5_output_`` prefix from the folder name). Returns None when the
+        collection dir is not laid out this way or the derived raw dir is absent.
+        """
+        collection_dir = Path(self.collection_dirs[task]).resolve()
+        raw_name = collection_dir.name.removeprefix("hdf5_output_")
+        if raw_name == collection_dir.name:
+            return None
+        raw_dir = collection_dir.parent.parent / raw_name
+        return raw_dir if raw_dir.is_dir() else None
+
+    @staticmethod
+    def _raw_filename_for(processed_name: str) -> str | None:
+        """Map ``<task>_episode_<N>.hdf5`` -> ``<task>_episode_abs_<N>.hdf5``."""
+        m = re.match(r"^(.*)_episode_(\d+)\.hdf5$", processed_name)
+        if not m:
+            return None
+        return f"{m.group(1)}_episode_abs_{m.group(2)}.hdf5"
+
+    def _refresh_task_info(self, raw_dir: Path, collection_dir: Path) -> None:
+        """Recount raw ``episode_abs`` files and update ``Count``/``Disk`` in
+        ``task_info.json`` for both the raw dir and the collection-dir copy."""
+
+        def update(path: Path) -> None:
+            if not path.is_file():
+                return
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            if not isinstance(data, dict):
+                return
+            count = sum(
+                1
+                for f in raw_dir.iterdir()
+                if f.name.endswith(".hdf5") and "episode_abs" in f.name
+            )
+            denom = ""
+            cur = str(data.get("Count", ""))
+            if "/" in cur:
+                denom = cur.split("/", 1)[1]
+            data["Count"] = f"{count}/{denom}" if denom else str(count)
+            try:
+                total, used, _ = shutil.disk_usage(raw_dir)
+                data["Disk"] = f"{used / 1024 ** 3:.1f}/{total / 1024 ** 3:.1f}GB"
+            except Exception:
+                pass
+            try:
+                path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
+        update(raw_dir / "task_info.json")
+        update(collection_dir / "task_info.json")
+
+    def _delete_raw_and_refresh_task_info(self, task: str, processed_path: Path) -> str | None:
+        raw_dir = self._raw_data_dir_for(task)
+        if raw_dir is None:
+            return None
+        raw_name = self._raw_filename_for(processed_path.name)
+        if raw_name is None:
+            return None
+        raw_path = raw_dir / raw_name
+        removed: str | None = None
+        try:
+            if raw_path.is_file():
+                raw_path.unlink()
+                removed = str(raw_path)
+        except Exception:
+            removed = None
+        try:
+            self._refresh_task_info(raw_dir, Path(self.collection_dirs[task]).resolve())
+        except Exception:
+            pass
+        return removed
+
+    def _collection_score(self, metrics: dict[str, object]) -> float:
+        """Composite offset-error score (lower is better).
+
+        Each term is normalized by its tolerance so position, rotation and
+        drift contribute on a common dimensionless scale. Missing/invalid
+        keypose metrics add a large penalty so partial records never outrank
+        complete ones.
+        """
+        pos_tol = max(self.collection_position_tolerance_m, 1e-6)
+        rot_tol = max(self.collection_rotation_tolerance_deg, 1e-6)
+        drift_tol = max(self.collection_final_descent_tolerance_m, 1e-6)
+        penalty = 1e6
+        total = 0.0
+        for kp in KEYPOSES:
+            m = metrics.get(kp) or {}
+            if not isinstance(m, dict) or any(
+                m.get(flag) for flag in ("missing", "missing_expected", "invalid", "invalid_rotation")
+            ):
+                total += penalty
+                continue
+            pe = m.get("position_error_m")
+            re_ = m.get("rotation_error_deg")
+            if pe is None or re_ is None:
+                total += penalty
+                continue
+            total += float(pe) / pos_tol + float(re_) / rot_tol
+        drift = metrics.get("final_descent_horizontal_drift_m")
+        if drift is not None:
+            total += float(drift) / drift_tol
+        return total
+
+    def _dedup_duplicate_collections(
+        self,
+        task: str,
+        pair_index: int,
+        keep_file: str,
+        force_keep_current: bool,
+    ) -> None:
+        """When several collected episodes map to the same sample pair, keep
+        only the best one and delete the rest.
+
+        Called right after a fresh collection is registered. If the fresh file
+        was accepted it is now the canonical collected data for the pair, so
+        every prior rejected attempt is deleted (``force_keep_current=True``).
+        If it was rejected, all still-pending attempts for the pair are scored
+        and only the one with the smallest composite offset error survives.
+        No-op when ``pair_index`` is invalid or there is only one candidate.
+        """
+        if pair_index is None or pair_index < 0:
+            return
+        candidates = [
+            ev for ev in self.collection_events
+            if ev.get("task") == task
+            and ev.get("pair_index") == pair_index
+            and not ev.get("deleted")
+            and ev.get("file")
+        ]
+        if len(candidates) <= 1:
+            return
+        if force_keep_current:
+            winner_file = keep_file
+        else:
+            winner = min(candidates, key=lambda ev: self._collection_score(ev.get("metrics") or {}))
+            winner_file = winner.get("file")
+        for ev in candidates:
+            file_path = ev.get("file")
+            if file_path == winner_file:
+                continue
+            self.delete_collection_file(file_path)
+            ev["deleted"] = True
+            self.push_collection_event(
+                {
+                    "task": task,
+                    "status": "deduped",
+                    "file": file_path,
+                    "pair_index": pair_index,
+                    "message": (
+                        f"重复采集：已保留偏移指标最优的一条 "
+                        f"({Path(winner_file).name if winner_file else '-'})，删除本条"
+                    ),
+                    "deleted": True,
+                    "advance": False,
+                }
+            )
+
+    def render_review_image(
+        self,
+        task: str,
+        path: Path,
+        analysis: dict[str, object] | None,
+        pair: dict[str, object] | None,
+        reasons: list[str],
+        metrics: dict[str, object],
+        status: str = "rejected",
+    ) -> str | None:
+        """Render the actual vs reference grasp/place bboxes onto the background
+        image and save it next to the collected file as ``<name>.review.png``.
+
+        Uses only the collected hdf5 (for keyposes) and the calibrated background
+        image; no browser data is involved. Returns the saved path or ``None``.
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            return None
+        overlay = self._build_review_overlay(task, analysis, pair)
+        if overlay is None:
+            return None
+        bg_path = self.background
+        if not bg_path.exists():
+            return None
+        try:
+            img = Image.open(bg_path).convert("RGB").resize((1280, 720))
+        except Exception:
+            return None
+        draw = ImageDraw.ImageDraw(img)
+        try:
+            font_label = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
+            font_text = ImageFont.truetype("DejaVuSans.ttf", 18)
+            font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
+        except Exception:
+            font_label = ImageFont.load_default()
+            font_text = ImageFont.load_default()
+            font_title = ImageFont.load_default()
+
+        def to_px(box):
+            return [(float(p[0]), float(p[1])) for p in (box or [])]
+
+        def draw_box(record, color, label):
+            if not record:
+                return
+            box = record.get("box_px") or record.get("box")
+            pts = to_px(box)
+            if len(pts) >= 3:
+                draw.polygon(pts, outline=color, width=5)
+                # direction arrow: center -> front edge midpoint
+                cx = sum(p[0] for p in pts) / len(pts)
+                cy = sum(p[1] for p in pts) / len(pts)
+                fx = (pts[0][0] + pts[1][0]) / 2
+                fy = (pts[0][1] + pts[1][1]) / 2
+                draw.line([(cx, cy), (fx, fy)], fill=color, width=4)
+            x = float(record.get("x", 0))
+            y = float(record.get("y", 0))
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=color)
+            if label:
+                draw.text((x + 10, y - 30), label, fill=color, font=font_label)
+
+        ref_color = {"grasp": (42, 168, 255), "place": (255, 178, 63)}
+        act_color = {"grasp": (255, 77, 109), "place": (255, 138, 59)}
+        for kp in ("grasp", "place"):
+            draw_box(overlay.get(f"reference_{kp}"), ref_color[kp], f"参考{kp}")
+            draw_box(overlay.get(f"actual_{kp}"), act_color[kp], f"实测{kp}")
+
+        # Legend + reasons block (top-left).
+        task_labels = {"centrifuge": "离心机", "multidrop": "分液器"}
+        status_label = "采集成功" if status == "accepted" else "采集未通过"
+        status_color = (90, 220, 120) if status == "accepted" else (255, 90, 90)
+        lines = [f"task={task_labels.get(task, task)}  pair={pair.get('index') if pair else '-'}"]
+        if not reasons:
+            lines.append(f"• {status_label}")
+        else:
+            for r in reasons:
+                lines.append(f"• {r}")
+        if metrics:
+            for kp in ("grasp", "place"):
+                m = metrics.get(kp) or {}
+                pe = m.get("position_error_m")
+                re_ = m.get("rotation_error_deg")
+                if pe is not None and re_ is not None:
+                    lines.append(f"{kp}: pos(XY)={float(pe)*100:.1f}cm rot={float(re_):.1f}deg")
+        y0 = 8
+        # semi-transparent backing
+        bbox = draw.textbbox((10, y0), "\n".join(lines), font=font_text)
+        draw.rectangle([bbox[0] - 6, bbox[1] - 6, bbox[2] + 6, bbox[3] + 6], fill=(0, 0, 0))
+        draw.text((10, y0), "\n".join(lines), fill=(255, 255, 255), font=font_text)
+        # status badge (top-right)
+        try:
+            sb = draw.textbbox((0, 0), status_label, font=font_title)
+            sw, sh = sb[2] - sb[0], sb[3] - sb[1]
+            sx, sy = 1280 - sw - 24, 12
+            draw.rectangle([sx - 10, sy - 6, sx + sw + 10, sy + sh + 6], fill=(0, 0, 0))
+            draw.text((sx, sy), status_label, fill=status_color, font=font_title)
+        except Exception:
+            pass
+
+        out_path = path.with_name(f"{path.name}.review.png")
+        try:
+            img.save(out_path, "PNG")
+        except Exception:
+            return None
+        return str(out_path)
 
     def cacheable_config(self) -> dict[str, object]:
         return {
@@ -1591,13 +2372,147 @@ class SamplingState:
         }
 
     def display_height_for(self, task: str, keypose: str, actual_height: float) -> float:
-        if task == "centrifuge":
-            return self.place_heights["multidrop"]
         return actual_height
+
+    def _render_display_payload(
+        self,
+        task: str,
+        keypose: str,
+        xy: tuple[float, float],
+        actual_height: float,
+        quat: np.ndarray,
+        tool_point: np.ndarray,
+    ) -> tuple[dict[str, object] | None, str | None]:
+        display_height = self.display_height_for(task, keypose, actual_height)
+        display_point = np.asarray([xy[0], xy[1], display_height], dtype=float)
+        u, v = project_world_point(display_point, self.model)
+        if u is None or v is None:
+            return None, "projection"
+        dx, dy = direction_from_pose(
+            np.asarray([tool_point[0], tool_point[1], tool_point[2], *quat], dtype=float),
+            self.direction_axis,
+            self.direction_mode,
+        )
+        direction_u = None
+        direction_v = None
+        if dx is not None and dy is not None:
+            end_uv, end_depth = project_points(
+                (display_point + np.asarray([dx, dy, 0.0], dtype=float) * 0.04).reshape(1, 3),
+                self.model,
+            )
+            if end_depth[0] > 0:
+                direction_u = float(end_uv[0, 0] - u)
+                direction_v = float(end_uv[0, 1] - v)
+        box = project_oriented_box(
+            display_point,
+            (dx, dy),
+            self.object_length_m,
+            self.object_width_m,
+            self.model,
+        )
+        if box is None:
+            return None, "box"
+        return {
+            "x": u,
+            "y": v,
+            "world_x": float(display_point[0]),
+            "world_y": float(display_point[1]),
+            "world_z": float(display_point[2]),
+            "actual_world_z": float(actual_height),
+            "tool_x": float(tool_point[0]),
+            "tool_y": float(tool_point[1]),
+            "tool_z": float(tool_point[2]),
+            "qx": float(quat[0]),
+            "qy": float(quat[1]),
+            "qz": float(quat[2]),
+            "qw": float(quat[3]),
+            "direction_u": direction_u,
+            "direction_v": direction_v,
+            **box_payload_fields(box),
+            "tool_direction_xy": [dx, dy],
+        }, None
 
     def build_sample_cache_signature(self) -> str:
         payload = json.dumps(self.cacheable_config(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _ik_margin_acceptable(self, cached_item: dict[str, object]) -> bool:
+        """Check whether a cached pair's IK joint margins meet the threshold.
+
+        Returns True if the margin check is disabled (threshold == 0) or both
+        grasp and place have a ``min_joint_limit_margin_fraction`` at/above the
+        threshold. Pairs missing the ik field (e.g. collected pairs whose
+        grasp/place were overwritten with actual-pose records) are accepted.
+        """
+        if self.ik_joint_limit_fraction_for_filter() <= 0.0:
+            return True
+        for keypose in KEYPOSES:
+            rec = cached_item.get(keypose)
+            if not isinstance(rec, dict):
+                continue
+            ik = rec.get("ik")
+            if not isinstance(ik, dict):
+                continue
+            margin = ik.get("min_joint_limit_margin_fraction")
+            if margin is None:
+                continue
+            try:
+                if float(margin) < self.ik_joint_limit_fraction_for_filter():
+                    return False
+            except (TypeError, ValueError):
+                continue
+        return True
+
+    def ik_joint_limit_fraction_for_filter(self) -> float:
+        return getattr(self, "ik_joint_limit_margin_fraction", 0.0)
+
+    def _recompute_cached_display_fields(self, task: str, cached_item: dict[str, object]) -> None:
+        """Recompute display-only projection fields using current display logic.
+
+        Cached pairs store the IK solution / collected tool pose (tool_x/y/z,
+        quat) which stay valid across display-rule changes, but the pixel/box
+        fields were projected at whatever ``display_height_for`` returned at
+        sample/collect time. For centrifuge these were pinned to the multidrop
+        height, so the drawn bbox was at the wrong Z. This rebuilds the display
+        fields for both the ``grasp`` and ``place`` sub-records from the stored
+        tool pose + quat so the UI and review image render boxes at the same Z
+        where IK was actually tested / the object actually was, without
+        invalidating the cache or re-running IK.
+        """
+        for keypose in KEYPOSES:
+            rec = cached_item.get(keypose)
+            if not isinstance(rec, dict):
+                continue
+            try:
+                tool_point = np.asarray(
+                    [rec.get("tool_x"), rec.get("tool_y"), rec.get("tool_z")], dtype=float
+                )
+                quat = np.asarray(
+                    [rec.get("qx", 0.0), rec.get("qy", 0.0), rec.get("qz", 0.0), rec.get("qw", 1.0)],
+                    dtype=float,
+                )
+            except (TypeError, ValueError):
+                continue
+            if (
+                tool_point.shape[0] < 3
+                or quat.shape[0] < 4
+                or not np.all(np.isfinite(tool_point))
+                or not np.all(np.isfinite(quat))
+            ):
+                continue
+            rotation = rotation_matrix_from_xyzw(quat)
+            if not np.all(np.isfinite(rotation)):
+                continue
+            object_point = apply_model_offset(self.model, tool_point, rotation)
+            if not np.all(np.isfinite(object_point)):
+                continue
+            xy = (float(object_point[0]), float(object_point[1]))
+            actual_height = float(object_point[2])
+            display, _ = self._render_display_payload(
+                task, keypose, xy, actual_height, quat, tool_point
+            )
+            if display is not None:
+                rec.update(display)
 
     def load_sample_cache(self) -> None:
         if not self.sample_cache.exists():
@@ -1609,6 +2524,7 @@ class SamplingState:
                 return
             pools = data.get("pools", {})
             reject_totals = data.get("reject_totals", {})
+            dropped = 0
             for task in TASKS:
                 items = pools.get(task, [])
                 if isinstance(items, list):
@@ -1618,6 +2534,17 @@ class SamplingState:
                             continue
                         cached_item = dict(item)
                         cached_item.setdefault("collected", False)
+                        # Drop uncollected pairs whose IK solution is at/beyond
+                        # joint limits — these are physically unreachable even
+                        # though PyBullet IK reported a valid EE pose. Collected
+                        # pairs are kept regardless (the operator already
+                        # reached them; their ik field may be overwritten by
+                        # actual-pose data).
+                        if not bool(cached_item.get("collected", False)):
+                            if not self._ik_margin_acceptable(cached_item):
+                                dropped += 1
+                                continue
+                        self._recompute_cached_display_fields(task, cached_item)
                         self.sample_pools[task].append(cached_item)
                 totals = reject_totals.get(task, {})
                 if isinstance(totals, dict):
@@ -1625,13 +2552,51 @@ class SamplingState:
                         {key: int(totals.get(key, 0)) for key in self.reject_totals[task]}
                     )
                 self.next_pair_index[task] = len(self.sample_pools[task])
+            if dropped > 0:
+                self.sample_cache_error = (
+                    f"cache load: dropped {dropped} uncollected pairs at/beyond "
+                    f"joint limits (margin < {self.ik_joint_limit_margin_fraction:.2%})"
+                )
             rng_state = data.get("rng_state")
             if rng_state is not None:
                 self.rng.setstate(rng_state_from_json(rng_state))
+            # Restore the last-shown recommendation position by pair index.
+            recommend_pair_indices = data.get("recommend_pair_indices", {})
+            if isinstance(recommend_pair_indices, dict):
+                for task in TASKS:
+                    pair_idx = int(recommend_pair_indices.get(task, -1))
+                    if pair_idx < 0:
+                        continue
+                    pool = self.sample_pools[task]
+                    found_pos = -1
+                    for pos, pair in enumerate(pool):
+                        if int(pair.get("index", -1)) == pair_idx:
+                            found_pos = pos
+                            break
+                    if found_pos >= 0:
+                        self.recommend_indices[task] = found_pos
+                    else:
+                        # Pair was dropped (e.g. by IK margin filter); land on
+                        # the first uncollected pair with index >= the saved
+                        # one so the operator stays roughly where they left off.
+                        for pos, pair in enumerate(pool):
+                            if not bool(pair.get("collected", False)) and int(pair.get("index", -1)) >= pair_idx:
+                                self.recommend_indices[task] = pos
+                                break
         except Exception as exc:
             self.sample_cache_error = f"cache load failed: {type(exc).__name__}: {exc}"
 
     def save_sample_cache_unlocked(self) -> None:
+        # Persist the current recommendation position by pair index (stable ID)
+        # rather than pool position, so it survives pool pruning / restarts.
+        recommend_pair_indices: dict[str, int] = {}
+        for task in TASKS:
+            pos = self.recommend_indices.get(task, -1)
+            pool = self.sample_pools.get(task, [])
+            if 0 <= pos < len(pool):
+                recommend_pair_indices[task] = int(pool[pos].get("index", -1))
+            else:
+                recommend_pair_indices[task] = -1
         value = {
             "signature": self.cache_signature,
             "config": self.cacheable_config(),
@@ -1639,6 +2604,7 @@ class SamplingState:
             "rng_state": rng_state_to_json(self.rng.getstate()),
             "pools": self.sample_pools,
             "reject_totals": self.reject_totals,
+            "recommend_pair_indices": recommend_pair_indices,
         }
         try:
             atomic_write_json(self.sample_cache, value)
@@ -1937,37 +2903,12 @@ class SamplingState:
         quat = random_quat_xyzw(self.rng)
         rotation = rotation_matrix_from_xyzw(quat)
         object_point = np.asarray([xy[0], xy[1], height_m], dtype=float)
-        display_height = self.display_height_for(task, keypose, height_m)
-        display_point = np.asarray([xy[0], xy[1], display_height], dtype=float)
         offset = np.asarray((self.model.offsets or {}).get("shared_tool_frame", [0.0, 0.0, 0.0]), dtype=float)
         tool_point = object_point - rotation @ offset
-        u, v = project_world_point(display_point, self.model)
-        if u is None or v is None:
-            return None, "projection"
-        dx, dy = direction_from_pose(
-            np.asarray([tool_point[0], tool_point[1], tool_point[2], *quat], dtype=float),
-            self.direction_axis,
-            self.direction_mode,
-        )
-        direction_u = None
-        direction_v = None
-        if dx is not None and dy is not None:
-            end_uv, end_depth = project_points(
-                (display_point + np.asarray([dx, dy, 0.0], dtype=float) * 0.04).reshape(1, 3),
-                self.model,
-            )
-            if end_depth[0] > 0:
-                direction_u = float(end_uv[0, 0] - u)
-                direction_v = float(end_uv[0, 1] - v)
-        box = project_oriented_box(
-            display_point,
-            (dx, dy),
-            self.object_length_m,
-            self.object_width_m,
-            self.model,
-        )
-        if box is None:
-            return None, "box"
+        display, error = self._render_display_payload(task, keypose, xy, height_m, quat, tool_point)
+        if display is None:
+            return None, error
+        dx, dy = display["tool_direction_xy"]
         direction_dot = None
         if dx is not None and dy is not None and self.min_tool_direction_dot > -1.0:
             ref = np.asarray([xy[0] - self.right_shoulder_xy[0], xy[1] - self.right_shoulder_xy[1]], dtype=float)
@@ -1982,23 +2923,7 @@ class SamplingState:
         return {
             "task": task,
             "keypose": keypose,
-            "x": u,
-            "y": v,
-            "world_x": float(display_point[0]),
-            "world_y": float(display_point[1]),
-            "world_z": float(display_point[2]),
-            "actual_world_z": float(object_point[2]),
-            "tool_x": float(tool_point[0]),
-            "tool_y": float(tool_point[1]),
-            "tool_z": float(tool_point[2]),
-            "qx": float(quat[0]),
-            "qy": float(quat[1]),
-            "qz": float(quat[2]),
-            "qw": float(quat[3]),
-            "direction_u": direction_u,
-            "direction_v": direction_v,
-            **box_payload_fields(box),
-            "tool_direction_xy": [dx, dy],
+            **display,
             "tool_direction_dot": direction_dot,
             "ik": ik,
         }, None
@@ -2124,6 +3049,11 @@ class SamplingState:
             pool_count = len(self.sample_pools[task])
             filling = task in self.fill_running
             target = self.fill_targets[task]
+        # Persist the recommendation position so a page refresh or server
+        # restart lands on the same sample the operator was viewing.
+        if advance:
+            with self.pool_lock:
+                self.save_sample_cache_unlocked()
         batch = self.sample_pairs_payload(task, [pair] if pair else [], 1, pool_count, target, filling)
         batch["collected_count"] = collected_count
         batch["uncollected_count"] = max(0, pool_count - collected_count)
@@ -2318,6 +3248,21 @@ class GuidanceHandler(BaseHTTPRequestHandler):
                 after = 0
             self.send_json(self.state.collection_events_payload(after))
             return
+        if path == "/api/collection-delete":
+            query = parse_qs(parsed.query)
+            file_path = query.get("file", [""])[0]
+            self.send_json(self.state.delete_collection_file(file_path))
+            return
+        if path == "/api/collection-keep":
+            query = parse_qs(parsed.query)
+            file_path = query.get("file", [""])[0]
+            self.send_json(self.state.keep_collection_file(file_path))
+            return
+        if path == "/api/review-image":
+            query = parse_qs(parsed.query)
+            file_path = query.get("file", [""])[0]
+            self.serve_review_image(file_path)
+            return
         self.send_error(404)
 
     def serve_file(self, path: Path) -> None:
@@ -2331,6 +3276,23 @@ class GuidanceHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def serve_review_image(self, file_path: str) -> None:
+        """Serve a saved review PNG. Accepts either the ``.review.png`` path
+        directly or the collected hdf5 path (``<name>.review.png`` is derived)."""
+        if not file_path:
+            self.send_error(404)
+            return
+        target = Path(file_path).resolve()
+        allowed_roots = [Path(self.state.collection_dirs[task]).resolve() for task in TASKS]
+        if not any(target == root or root in target.parents for root in allowed_roots):
+            self.send_error(404)
+            return
+        if target.name.endswith(".review.png"):
+            img_path = target
+        else:
+            img_path = target.with_name(f"{target.name}.review.png")
+        self.serve_file(img_path)
 
     def proxy_recommend_live_stream(self) -> None:
         url = self.state.recommend_live_stream_url
@@ -2392,6 +3354,7 @@ def main() -> None:
         },
         ik_position_tolerance=args.ik_position_tolerance,
         ik_rotation_tolerance_deg=args.ik_rotation_tolerance_deg,
+        ik_joint_limit_margin_fraction=args.ik_joint_limit_margin_fraction,
         collection_dirs={
             "centrifuge": args.centrifuge_collection_dir,
             "multidrop": args.multidrop_collection_dir,
@@ -2420,6 +3383,8 @@ def main() -> None:
         invert_gripper_value=args.invert_gripper_value,
         direction_axis=args.direction_axis,
         direction_mode=args.direction_mode,
+        delete_raw_on_invalid=args.delete_raw_on_invalid,
+        auto_delete_invalid=args.auto_delete_invalid,
     )
     GuidanceHandler.state = state
     GuidanceHandler.ui_path = Path(__file__).with_name("sampling_guidance_ui.html").resolve()

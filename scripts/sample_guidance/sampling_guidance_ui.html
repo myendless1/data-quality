@@ -113,6 +113,115 @@
       display: block;
       overflow-wrap: anywhere;
     }
+    .last-collection {
+      border: 1px solid #ff3b3b;
+      border-radius: 6px;
+      background: rgba(28, 14, 16, 0.55);
+      padding: 10px 12px;
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.42;
+      min-height: 92px;
+      max-width: 520px;
+      width: 100%;
+      justify-self: end;
+      overflow-wrap: anywhere;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .last-collection .lc-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .last-collection .lc-badge {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .last-collection.ok .lc-badge { background: #1f6f43; color: #d8ffd8; }
+    .last-collection.fail .lc-badge { background: #7a1f1f; color: #ffd2d2; }
+    .last-collection.warn { border-color: #e0a93b; }
+    .last-collection.warn.ok .lc-badge { background: #7a5b1f; color: #ffe9b8; }
+    .last-collection .lc-warn {
+      color: #ffd98a;
+      font-size: 13px;
+      white-space: pre-wrap;
+      border-left: 3px solid #e0a93b;
+      padding: 4px 8px;
+      background: rgba(122, 91, 31, 0.18);
+      border-radius: 3px;
+    }
+    .last-collection .lc-reason {
+      color: #d6dde3;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .last-collection .lc-meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .last-collection .lc-empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .review-image-wrap {
+      max-width: 520px;
+      width: 100%;
+      justify-self: end;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #050607;
+      overflow: hidden;
+    }
+    .review-image-wrap[hidden] { display: none; }
+    .review-image-wrap img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .review-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      border: 1px solid #ff3b3b;
+      border-radius: 6px;
+      background: rgba(40, 18, 20, 0.55);
+      padding: 8px 10px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .review-bar[hidden] { display: none; }
+    .review-bar .review-title {
+      font-weight: 700;
+      color: #ffd2d2;
+      white-space: nowrap;
+    }
+    .review-bar .review-reasons {
+      flex: 1 1 220px;
+      color: #d6dde3;
+      overflow-wrap: anywhere;
+    }
+    .review-bar .review-actions {
+      display: inline-flex;
+      gap: 8px;
+    }
+    .review-bar button {
+      height: 32px;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+    .review-bar #reviewKeepBtn {
+      background: #2a3138;
+      border-color: var(--line);
+    }
     canvas {
       position: absolute;
       inset: 0;
@@ -226,6 +335,14 @@
           <img id="recommendLiveBackground" class="live-background" alt="">
           <canvas id="recommendCanvas" width="1280" height="720"></canvas>
         </div>
+        <div class="review-bar" id="reviewBar" hidden>
+          <span class="review-title">采集未通过·待复核</span>
+          <span class="review-reasons" id="reviewReasons"></span>
+          <span class="review-actions">
+            <button id="reviewDeleteBtn" type="button">删除文件</button>
+            <button id="reviewKeepBtn" type="button">保留</button>
+          </span>
+        </div>
       </div>
       <div class="board distribution">
         <div class="title">
@@ -233,6 +350,12 @@
           <span id="mainMeta"></span>
         </div>
         <div class="canvas-wrap"><canvas id="mainCanvas" width="1280" height="720"></canvas></div>
+        <div class="last-collection" id="lastCollection" aria-live="polite">
+          <span class="lc-empty">等待上一次采集结果…</span>
+        </div>
+        <div class="review-image-wrap" id="reviewImageWrap" hidden>
+          <img id="reviewImage" alt="采集关键帧与bbox叠加图">
+        </div>
       </div>
     </section>
     <section class="controls">
@@ -258,6 +381,9 @@
     const statusEl = document.getElementById('status');
     const toastEl = document.getElementById('toast');
     const taskSelect = document.getElementById('taskSelect');
+    const lastCollectionEl = document.getElementById('lastCollection');
+    const reviewImageWrap = document.getElementById('reviewImageWrap');
+    const reviewImage = document.getElementById('reviewImage');
     const colors = { grasp: '#2aa8ff', place: '#ffb23f' };
     const candidateColors = { grasp: '#6ae6ff', place: '#ffe07a' };
     const taskLabels = { centrifuge: '离心机', multidrop: '分液器' };
@@ -279,6 +405,8 @@
     let recommendController = null;
     let mainCount = 100;
     let lastCollectionEventId = 0;
+    let lastCollectionRecord = null;
+    let pendingReview = null;
     let collectionPollTimer = null;
     let toastTimer = null;
     let recommendLiveReady = false;
@@ -500,8 +628,9 @@
     function drawBatchPairs(ctx, data, showLabels = false, alpha = 0.2) {
       const pairs = data?.batch?.pairs || [];
       ctx.save();
-      ctx.globalAlpha = alpha;
       for (const pair of pairs) {
+        const collected = !!pair.collected;
+        ctx.globalAlpha = collected ? 1.0 : alpha;
         const label = showLabels && pairs.length <= 120 ? String(pair.index + 1) : '';
         drawBatchPose(ctx, pair.grasp, candidateColors.grasp, label);
         drawBatchPose(ctx, pair.place, candidateColors.place, '');
@@ -588,6 +717,121 @@
         labels.push(`${(constraints.object_length_m * 100).toFixed(0)}cm x ${(constraints.object_width_m * 100).toFixed(0)}cm`);
       }
       metaEl.textContent = labels.join(' / ');
+      drawReviewOverlay(ctx);
+    }
+
+    const reviewColors = { grasp: '#ff4d6d', place: '#ff8a3b' };
+    const reviewLabels = { grasp: '实测抓', place: '实测放' };
+
+    function drawReviewOverlay(ctx) {
+      const overlay = pendingReview && pendingReview.overlay;
+      if (!overlay) return;
+      const options = {
+        drawBox: true,
+        labelFont: '800 26px system-ui',
+        labelOffsetX: 16,
+        labelOffsetY: -16
+      };
+      ctx.save();
+      ctx.globalAlpha = 0.96;
+      for (const keypose of ['grasp', 'place']) {
+        const actual = overlay[`actual_${keypose}`];
+        if (actual) {
+          drawBatchPose(ctx, actual, reviewColors[keypose], reviewLabels[keypose], options);
+        }
+      }
+      ctx.restore();
+    }
+
+    function setPendingReview(event) {
+      pendingReview = {
+        file: event.file || '',
+        task: event.task,
+        pair_index: event.pair_index,
+        reasons: Array.isArray(event.reasons) ? event.reasons.map(translateVisibleText) : [],
+        overlay: event.overlay || null,
+        time: event.time,
+      };
+      renderReviewBar();
+      renderRecommend();
+    }
+
+    function clearPendingReview() {
+      pendingReview = null;
+      renderReviewBar();
+      renderRecommend();
+    }
+
+    function renderReviewBar() {
+      const bar = document.getElementById('reviewBar');
+      const reasonsEl = document.getElementById('reviewReasons');
+      if (!pendingReview) {
+        bar.hidden = true;
+        return;
+      }
+      bar.hidden = false;
+      reasonsEl.textContent = pendingReview.reasons.length
+        ? pendingReview.reasons.join('；')
+        : '采集未通过校验';
+    }
+
+    async function deletePendingReviewFile() {
+      if (!pendingReview || !pendingReview.file) {
+        clearPendingReview();
+        return;
+      }
+      const btn = document.getElementById('reviewDeleteBtn');
+      btn.disabled = true;
+      btn.textContent = '删除中…';
+      try {
+        const params = new URLSearchParams({ file: pendingReview.file, t: Date.now().toString() });
+        const res = await fetch(`/api/collection-delete?${params.toString()}`);
+        const data = await res.json();
+        if (!data.ok) {
+          setStatus(`删除失败：${translateVisibleText(data.error) || '未知错误'}`, true);
+          showToast('删除失败', [translateVisibleText(data.error) || '未知错误']);
+          return;
+        }
+        setStatus('已删除采集文件，可继续采集下一条');
+        showToast('已删除', [pendingReview.file.split('/').pop() || '']);
+      } catch (err) {
+        setStatus(`删除请求失败：${errorText(err)}`, true);
+        showToast('删除请求失败', [errorText(err)]);
+        return;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '删除文件';
+      }
+      clearPendingReview();
+    }
+
+    async function keepPendingReviewFile() {
+      if (!pendingReview || !pendingReview.file) {
+        clearPendingReview();
+        return;
+      }
+      const btn = document.getElementById('reviewKeepBtn');
+      btn.disabled = true;
+      btn.textContent = '处理中…';
+      try {
+        const params = new URLSearchParams({ file: pendingReview.file, t: Date.now().toString() });
+        const res = await fetch(`/api/collection-keep?${params.toString()}`);
+        const data = await res.json();
+        if (!data.ok) {
+          setStatus(`保留失败：${translateVisibleText(data.error) || '未知错误'}`, true);
+          showToast('保留失败', [translateVisibleText(data.error) || '未知错误']);
+          return;
+        }
+        setStatus('已保留采集文件，继续下一条');
+      } catch (err) {
+        setStatus(`保留请求失败：${errorText(err)}`, true);
+        showToast('保留请求失败', [errorText(err)]);
+        return;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '保留';
+      }
+      clearPendingReview();
     }
 
     async function fetchPayload(task, count, controller) {
@@ -639,9 +883,76 @@
       }
     }
 
+    function renderLastCollection() {
+      const el = lastCollectionEl;
+      const record = lastCollectionRecord;
+      el.classList.remove('ok', 'fail', 'warn');
+      if (!record) {
+        el.innerHTML = '<span class="lc-empty">等待上一次采集结果…</span>';
+        return;
+      }
+      const ok = record.status === 'accepted';
+      const warnings = Array.isArray(record.warnings)
+        ? record.warnings.map(translateVisibleText).filter(Boolean)
+        : [];
+      el.classList.add(ok ? 'ok' : 'fail');
+      if (warnings.length) el.classList.add('warn');
+      const badge = ok ? (warnings.length ? '成功(警告)' : '成功') : '失败';
+      const pairLabel = Number.isFinite(record.pair_index) ? `样本 #${record.pair_index + 1}` : '';
+      const taskName = taskLabel(record.task);
+      const timeStr = Number.isFinite(record.time)
+        ? new Date(record.time * 1000).toLocaleTimeString()
+        : '';
+      let reasonText = '';
+      if (!ok) {
+        const reasons = Array.isArray(record.reasons) && record.reasons.length
+          ? record.reasons.map(translateVisibleText)
+          : [translateVisibleText(record.message) || '采集文件未通过校验'];
+        reasonText = reasons.join('；');
+      } else {
+        reasonText = translateVisibleText(record.message) || '采集有效，已匹配并完成采样点';
+      }
+      const metaParts = [taskName, pairLabel, timeStr].filter(Boolean);
+      const warnHtml = warnings.length
+        ? `<div class="lc-warn">${warnings.map(escapeHtml).join('<br>')}</div>`
+        : '';
+      el.innerHTML =
+        `<div class="lc-header"><span class="lc-badge">${badge}</span>${
+          pairLabel ? `<span>${escapeHtml(pairLabel)}</span>` : ''
+        }</div>` +
+        `<div class="lc-reason">${escapeHtml(reasonText)}</div>` +
+        warnHtml +
+        (metaParts.length ? `<div class="lc-meta">${escapeHtml(metaParts.join(' · '))}</div>` : '');
+    }
+
     async function handleCollectionEvent(event) {
       if (!event || !event.status) return;
+      if (event.status === 'deduped') {
+        const file = (event.file || '').split('/').pop() || '';
+        showToast('重复采集已去重', [translateVisibleText(event.message) || `已删除重复文件 ${file}`]);
+        return;
+      }
+      lastCollectionRecord = {
+        status: event.status,
+        task: event.task,
+        pair_index: event.pair_index,
+        message: event.message,
+        reasons: event.reasons,
+        warnings: event.warnings,
+        deleted: event.deleted,
+        time: event.time,
+        file: event.file,
+      };
+      renderLastCollection();
+      if (event.review_image) {
+        reviewImage.src = `/api/review-image?file=${encodeURIComponent(event.review_image)}&t=${Date.now()}`;
+        reviewImageWrap.hidden = false;
+      } else if (event.status !== 'pending') {
+        reviewImageWrap.hidden = true;
+        reviewImage.removeAttribute('src');
+      }
       if (event.status === 'accepted') {
+        clearPendingReview();
         const label = Number.isFinite(event.pair_index) ? ` #${event.pair_index + 1}` : '';
         setStatus(`采集有效${label}，自动跳到下一条`);
         if (event.task && event.task !== taskSelect.value) {
@@ -652,6 +963,11 @@
         return;
       }
       if (event.status === 'rejected') {
+        if (event.pending_review) {
+          setPendingReview(event);
+        } else {
+          clearPendingReview();
+        }
         const reasons = Array.isArray(event.reasons) && event.reasons.length
           ? event.reasons.map(translateVisibleText)
           : [translateVisibleText(event.message) || '采集文件未通过校验'];
@@ -748,6 +1064,8 @@
     }
 
     document.getElementById('sampleBtn').onclick = () => refreshRecommend(true);
+    document.getElementById('reviewDeleteBtn').onclick = () => deletePendingReviewFile();
+    document.getElementById('reviewKeepBtn').onclick = () => keepPendingReviewFile();
     taskSelect.onchange = async () => {
       await refreshMain();
       await refreshRecommend(false);
