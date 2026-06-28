@@ -1,0 +1,104 @@
+{
+  "urdf": "/media/damoxing/fileset/data_quality_check/scripts/sample_guidance/astribot_descriptions/urdf/astribot_s1_urdf/astribot_whole_body.urdf",
+  "tip_link": "astribot_arm_right_end_effector",
+  "tip_joint_index": 24,
+  "joint_column_map": {
+    "torso": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "left_arm": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "right_arm": [
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21
+    ],
+    "right_gripper": [
+      22
+    ],
+    "head": [
+      23,
+      24
+    ]
+  },
+  "sampled_files": [
+    "/media/damoxing/datasets/astribot_tasks/myendless/centrifuge/centrifuge_episode_0.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/centrifuge/centrifuge_episode_1.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/centrifuge/centrifuge_episode_2.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/centrifuge/centrifuge_episode_3.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/multidrop/multidrop_episode_0.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/multidrop/multidrop_episode_1.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/multidrop/multidrop_episode_2.hdf5",
+    "/media/damoxing/datasets/astribot_tasks/myendless/multidrop/multidrop_episode_3.hdf5"
+  ],
+  "frames": 480,
+  "transform_data_from_urdf": {
+    "rotation_matrix": [
+      [
+        0.9999991185433933,
+        0.0009543856814239779,
+        0.0009230711819858425
+      ],
+      [
+        -0.0009523737154104508,
+        0.9999971754465805,
+        -0.0021776324681237512
+      ],
+      [
+        -0.0009251468759689589,
+        0.0021767514399037,
+        0.9999972029243015
+      ]
+    ],
+    "translation": [
+      -0.0004899596419117302,
+      0.0021332899376116377,
+      0.09791047040665701
+    ],
+    "rotation_quat_xyzw": [
+      3.2303722359249877e-06,
+      -5.911205492462715e-05,
+      -0.00017556312096036862,
+      0.9999999828364599
+    ]
+  },
+  "fk_position_error_raw_m": {
+    "mean": 0.09698588959501121,
+    "median": 0.09701018662162238,
+    "max": 0.09964519397311371
+  },
+  "fk_position_error_aligned_m": {
+    "mean": 0.0008941521287284302,
+    "median": 0.0005011756857212852,
+    "max": 0.0051011041951537
+  },
+  "fk_rotation_error_aligned_deg": {
+    "mean": 0.2340002142972863,
+    "median": 0.09944742977931577,
+    "max": 2.134998338242917
+  },
+  "ik_roundtrip_position_error_m": {
+    "mean": 0.0010734556669494929,
+    "median": 0.0010500358792843746,
+    "max": 0.0018206314413492712
+  },
+  "ik_roundtrip_rotation_error_deg": {
+    "mean": 0.02166661360728289,
+    "median": 0.02056783555523009,
+    "max": 0.032334216934241294
+  }
+}

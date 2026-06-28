@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>推荐采样点</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111417;
+      --panel: #1d2328;
+      --line: #343c45;
+      --text: #f4f7f8;
+      --muted: #a8b3bd;
+      --grasp: #2aa8ff;
+      --place: #ffb23f;
+      --candidate: #63e58c;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: 1fr auto;
+    }
+    .boards {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(520px, 3.4fr) minmax(260px, 0.95fr);
+      gap: 14px;
+      padding: 14px;
+      max-width: 1900px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .board {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 8px;
+    }
+    .title {
+      min-height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .title strong {
+      color: var(--text);
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      align-self: center;
+      border: 1px solid var(--line);
+      background: #050607;
+      overflow: hidden;
+    }
+    .board.distribution {
+      align-self: start;
+    }
+    .board.distribution .canvas-wrap {
+      max-width: 520px;
+      justify-self: end;
+    }
+    .board.distribution .title {
+      max-width: 520px;
+      justify-self: end;
+      width: 100%;
+      align-items: flex-start;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 4px;
+    }
+    .board.distribution .title strong {
+      font-size: 28px;
+      line-height: 1.08;
+    }
+    .board.distribution #mainMeta {
+      display: grid;
+      gap: 2px;
+      width: 100%;
+      color: #c6d2dd;
+      font-size: 15px;
+      line-height: 1.25;
+    }
+    .board.distribution #mainMeta span {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .controls {
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    select, input, button {
+      height: 38px;
+      border: 1px solid var(--line);
+      background: #2a3138;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0 12px;
+      font-weight: 650;
+      font-size: 14px;
+    }
+    input {
+      width: 92px;
+    }
+    button {
+      background: #1766d1;
+      border-color: #2f80ed;
+      cursor: pointer;
+    }
+    button:active { transform: translateY(1px); }
+    .pill {
+      color: var(--muted);
+      font-size: 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      max-width: min(720px, 100%);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .legend {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 76px;
+      transform: translateX(-50%) translateY(18px);
+      max-width: min(680px, calc(100vw - 28px));
+      border: 1px solid rgba(255, 107, 107, 0.65);
+      background: rgba(44, 22, 24, 0.96);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 12px 14px;
+      box-shadow: 0 14px 36px rgba(0,0,0,0.36);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 160ms ease, transform 160ms ease;
+      z-index: 20;
+      font-size: 14px;
+      line-height: 1.42;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .toast strong {
+      display: block;
+      margin-bottom: 4px;
+      color: #ffd2d2;
+      font-size: 15px;
+    }
+    @media (max-width: 980px) {
+      .boards { grid-template-columns: 1fr; }
+      .board.distribution .canvas-wrap,
+      .board.distribution .title {
+        max-width: none;
+        justify-self: stretch;
+      }
+      .title { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="boards">
+      <div class="board recommendation">
+        <div class="title">
+          <strong>推荐窗口</strong>
+          <span id="recommendMeta"></span>
+        </div>
+        <div class="canvas-wrap"><canvas id="recommendCanvas" width="1280" height="720"></canvas></div>
+      </div>
+      <div class="board distribution">
+        <div class="title">
+          <strong>总体分布</strong>
+          <span id="mainMeta"></span>
+        </div>
+        <div class="canvas-wrap"><canvas id="mainCanvas" width="1280" height="720"></canvas></div>
+      </div>
+    </section>
+    <section class="controls">
+      <select id="taskSelect" aria-label="任务">
+        <option value="centrifuge">centrifuge</option>
+        <option value="multidrop">multidrop</option>
+      </select>
+      <button id="sampleBtn">下一条</button>
+      <span class="legend"><span class="dot" style="background: var(--grasp)"></span>grasp</span>
+      <span class="legend"><span class="dot" style="background: var(--place)"></span>place</span>
+      <span class="pill" id="status">加载中</span>
+    </section>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script>
+    const mainCanvas = document.getElementById('mainCanvas');
+    const recommendCanvas = document.getElementById('recommendCanvas');
+    const mainCtx = mainCanvas.getContext('2d');
+    const recommendCtx = recommendCanvas.getContext('2d');
+    const mainMeta = document.getElementById('mainMeta');
+    const recommendMeta = document.getElementById('recommendMeta');
+    const statusEl = document.getElementById('status');
+    const toastEl = document.getElementById('toast');
+    const taskSelect = document.getElementById('taskSelect');
+    const colors = { grasp: '#2aa8ff', place: '#ffb23f' };
+    const candidateColors = { grasp: '#6ae6ff', place: '#ffe07a' };
+    let background = new Image();
+    let mainPayload = null;
+    let recommendPayload = null;
+    let mainSeq = 0;
+    let recommendSeq = 0;
+    let mainController = null;
+    let recommendController = null;
+    let mainCount = 100;
+    let lastCollectionEventId = 0;
+    let collectionPollTimer = null;
+    let toastTimer = null;
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+    }
+
+    function showToast(title, lines) {
+      if (toastTimer) clearTimeout(toastTimer);
+      const body = Array.isArray(lines)
+        ? lines.filter(Boolean).map(escapeHtml).join('<br>')
+        : escapeHtml(lines || '');
+      toastEl.innerHTML = `<strong>${escapeHtml(title)}</strong>${body}`;
+      toastEl.classList.add('show');
+      toastTimer = setTimeout(() => {
+        toastEl.classList.remove('show');
+      }, 5000);
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function drawBackground(ctx) {
+      ctx.clearRect(0, 0, 1280, 720);
+      if (background.complete) ctx.drawImage(background, 0, 0, 1280, 720);
+    }
+
+    function drawArrowHead(ctx, fromX, fromY, toX, toY, size) {
+      const angle = Math.atan2(toY - fromY, toX - fromX);
+      ctx.beginPath();
+      ctx.moveTo(toX, toY);
+      ctx.lineTo(toX - size * Math.cos(angle - Math.PI / 6), toY - size * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(toX - size * Math.cos(angle + Math.PI / 6), toY - size * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    function drawPoint(ctx, point, alpha = 0.72) {
+      const color = colors[point.keypose] || '#ffffff';
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+      if (Number.isFinite(point.direction_u) && Number.isFinite(point.direction_v)) {
+        const norm = Math.hypot(point.direction_u, point.direction_v);
+        if (norm > 1e-6) {
+          const scale = 24 / norm;
+          const ex = point.x + point.direction_u * scale;
+          const ey = point.y + point.direction_v * scale;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(point.x, point.y);
+          ctx.lineTo(ex, ey);
+          ctx.stroke();
+          drawArrowHead(ctx, point.x, point.y, ex, ey, 5);
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawHull(ctx, hull, color) {
+      if (!hull || hull.length < 3) return;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([9, 7]);
+      ctx.beginPath();
+      hull.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawCandidate(ctx, sample) {
+      if (!sample || sample.error || !sample.candidate) return;
+      const c = sample.candidate;
+      const color = candidateColors[sample.keypose] || '#63e58c';
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 15, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(c.x - 28, c.y);
+      ctx.lineTo(c.x + 28, c.y);
+      ctx.moveTo(c.x, c.y - 28);
+      ctx.lineTo(c.x, c.y + 28);
+      ctx.stroke();
+      ctx.font = '700 24px system-ui';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(sample.keypose, Math.min(c.x + 18, 1190), Math.max(c.y - 14, 32));
+      ctx.restore();
+    }
+
+    function drawBatchPose(ctx, pose, color, label, options = {}) {
+      const drawBox = options.drawBox || false;
+      const box = pose.box_px || pose.box;
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      if (drawBox && Array.isArray(box) && box.length >= 4) {
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        box.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+        ctx.closePath();
+        ctx.globalAlpha *= 0.16;
+        ctx.fill();
+        ctx.globalAlpha /= 0.16;
+        ctx.stroke();
+        const centerX = box.reduce((sum, p) => sum + p[0], 0) / box.length;
+        const centerY = box.reduce((sum, p) => sum + p[1], 0) / box.length;
+        const frontX = (box[0][0] + box[1][0]) / 2;
+        const frontY = (box[0][1] + box[1][1]) / 2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(11,15,18,0.82)';
+        ctx.fillStyle = 'rgba(11,15,18,0.82)';
+        ctx.lineWidth = 8;
+        ctx.beginPath();
+        ctx.moveTo(centerX, centerY);
+        ctx.lineTo(frontX, frontY);
+        ctx.stroke();
+        drawArrowHead(ctx, centerX, centerY, frontX, frontY, 11);
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(centerX, centerY);
+        ctx.lineTo(frontX, frontY);
+        ctx.stroke();
+        drawArrowHead(ctx, centerX, centerY, frontX, frontY, 8);
+      } else {
+        ctx.beginPath();
+        ctx.arc(pose.x, pose.y, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (!drawBox && Number.isFinite(pose.direction_u) && Number.isFinite(pose.direction_v)) {
+        const norm = Math.hypot(pose.direction_u, pose.direction_v);
+        if (norm > 1e-6) {
+          const scale = 22 / norm;
+          const ex = pose.x + pose.direction_u * scale;
+          const ey = pose.y + pose.direction_v * scale;
+          ctx.beginPath();
+          ctx.moveTo(pose.x, pose.y);
+          ctx.lineTo(ex, ey);
+          ctx.stroke();
+          drawArrowHead(ctx, pose.x, pose.y, ex, ey, 4.5);
+        }
+      }
+      if (label) {
+        ctx.font = '700 11px system-ui';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, pose.x + 7, pose.y - 7);
+      }
+      ctx.restore();
+    }
+
+    function drawBatchPairs(ctx, data, showLabels = false, alpha = 0.2) {
+      const pairs = data?.batch?.pairs || [];
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      for (const pair of pairs) {
+        const label = showLabels && pairs.length <= 120 ? String(pair.index + 1) : '';
+        drawBatchPose(ctx, pair.grasp, candidateColors.grasp, label);
+        drawBatchPose(ctx, pair.place, candidateColors.place, '');
+      }
+      ctx.restore();
+    }
+
+    function drawCandidateCloud(ctx, sample, alpha = 0.2) {
+      if (!sample || sample.error) return;
+      const color = candidateColors[sample.keypose] || '#63e58c';
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      for (const item of sample.top_candidates || []) {
+        ctx.beginPath();
+        ctx.arc(item.x, item.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawPayloadView(ctx, metaEl, data, showLabels = false, distributionAlpha = 0.2) {
+      drawBackground(ctx);
+      const task = data?.task || taskSelect.value;
+      const samples = data?.samples || {};
+      for (const keypose of ['grasp', 'place']) {
+        const group = data?.groups?.[`${task}:${keypose}`];
+        drawHull(ctx, group?.hull, keypose === 'grasp' ? 'rgba(42,168,255,0.2)' : 'rgba(255,178,63,0.2)');
+        drawCandidateCloud(ctx, samples[keypose], distributionAlpha);
+      }
+      drawBatchPairs(ctx, data, showLabels, distributionAlpha);
+      drawCandidate(ctx, samples.grasp);
+      drawCandidate(ctx, samples.place);
+
+      const labels = [];
+      const batch = data?.batch;
+      if (batch) labels.push(`pairs ${batch.count}/${batch.requested}`);
+      const heights = batch?.heights || {};
+      const placeH = heights[`${task}:place`]?.height_m;
+      if (Number.isFinite(placeH)) labels.push(`${task} place ${placeH.toFixed(3)}m`);
+      const constraints = batch?.constraints || {};
+      if (constraints.workspace_xy) {
+        labels.push(`workspace ${constraints.workspace_xy.map(v => Number(v).toFixed(2)).join(',')}`);
+      }
+      metaEl.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
+    }
+
+    function renderMain() {
+      if (!mainPayload) return;
+      drawPayloadView(mainCtx, mainMeta, mainPayload, false, 0.2);
+    }
+
+    function renderRecommend() {
+      if (!recommendPayload) return;
+      drawRecommendationView(recommendCtx, recommendMeta, recommendPayload);
+    }
+
+    function drawRecommendationView(ctx, metaEl, data) {
+      drawBackground(ctx);
+      const pair = data?.batch?.pairs?.[0];
+      if (!pair) {
+        metaEl.textContent = '无可用推荐';
+        return;
+      }
+      ctx.save();
+      ctx.globalAlpha = 0.95;
+      drawBatchPose(ctx, pair.grasp, candidateColors.grasp, 'grasp', { drawBox: true });
+      drawBatchPose(ctx, pair.place, candidateColors.place, 'place', { drawBox: true });
+      ctx.restore();
+
+      const batch = data.batch || {};
+      const constraints = batch.constraints || {};
+      const labels = [];
+      if (Number.isFinite(batch.uncollected_count)) {
+        labels.push(`未采集剩余 ${batch.uncollected_count}`);
+      }
+      if (Number.isFinite(constraints.object_length_m) && Number.isFinite(constraints.object_width_m)) {
+        labels.push(`${(constraints.object_length_m * 100).toFixed(0)}cm x ${(constraints.object_width_m * 100).toFixed(0)}cm`);
+      }
+      metaEl.textContent = labels.join(' / ');
+    }
+
+    async function fetchPayload(task, count, controller) {
+      const params = new URLSearchParams({
+        task,
+        count,
+        t: Date.now().toString()
+      });
+      const res = await fetch(`/api/data?${params.toString()}`, { signal: controller.signal });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return await res.json();
+    }
+
+    async function fetchRecommendation(task, advance, controller) {
+      const params = new URLSearchParams({
+        task,
+        advance: advance ? '1' : '0',
+        t: Date.now().toString()
+      });
+      const res = await fetch(`/api/recommend?${params.toString()}`, { signal: controller.signal });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return await res.json();
+    }
+
+    async function fetchCollectionEvents() {
+      const params = new URLSearchParams({
+        after: String(lastCollectionEventId),
+        t: Date.now().toString()
+      });
+      const res = await fetch(`/api/collection-events?${params.toString()}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return await res.json();
+    }
+
+    async function pollCollectionEvents() {
+      try {
+        const payload = await fetchCollectionEvents();
+        if (Number.isFinite(payload.last_event_id)) {
+          lastCollectionEventId = Math.max(lastCollectionEventId, payload.last_event_id);
+        }
+        for (const event of payload.events || []) {
+          await handleCollectionEvent(event);
+        }
+        if (payload.error) {
+          setStatus(`采集目录扫描警告：${payload.error}`, true);
+        }
+      } catch (err) {
+        setStatus(`采集事件轮询失败：${err}`, true);
+      }
+    }
+
+    async function handleCollectionEvent(event) {
+      if (!event || !event.status) return;
+      if (event.status === 'accepted') {
+        const label = Number.isFinite(event.pair_index) ? ` #${event.pair_index + 1}` : '';
+        setStatus(`采集有效${label}，自动跳到下一条`);
+        if (event.task && event.task !== taskSelect.value) {
+          taskSelect.value = event.task;
+          await refreshMain();
+        }
+        await refreshRecommend(true);
+        return;
+      }
+      if (event.status === 'rejected') {
+        const reasons = Array.isArray(event.reasons) && event.reasons.length
+          ? event.reasons
+          : [event.message || '采集文件未通过校验'];
+        const title = event.deleted === false ? '采集未通过，文件已保留' : '采集未通过，文件已删除';
+        showToast(title, reasons);
+        setStatus(event.message || '采集文件未通过校验', true);
+      }
+    }
+
+    function statusFromPayload(prefix, data) {
+      const now = new Date();
+      const cache = data.cache || {};
+      const batch = data.batch || {};
+      const heights = batch.heights || {};
+      const graspH = heights.grasp?.height_m;
+      const placeH = heights[`${data.task}:place`]?.height_m;
+      const heightText = Number.isFinite(graspH) && Number.isFinite(placeH)
+        ? `；高度 grasp ${graspH.toFixed(3)}m / place ${placeH.toFixed(3)}m`
+        : '';
+      const reject = batch.reject_counts || {};
+      const rejectText = `；拒绝 overlap ${reject.overlap || 0} blocked ${reject.blocked || 0} box ${reject.box || 0} direction ${reject.direction || 0} graspIK ${reject.grasp_ik || 0} placeIK ${reject.place_ik || 0}`;
+      const pairCache = batch.cache || {};
+      const cacheText = Number.isFinite(pairCache.pool_count)
+        ? `；缓存 ${pairCache.pool_count}/${pairCache.target || 0}${pairCache.filling ? ' filling' : ''}`
+        : '';
+      const error = cache.error ? `；扫描警告 ${cache.error}` : '';
+      return `${prefix} ${now.toLocaleTimeString()}；${data.task}；pairs ${batch.count || 0}/${batch.requested || 0}${heightText}${rejectText}${cacheText}${error}`;
+    }
+
+    async function refreshMain() {
+      const seq = ++mainSeq;
+      const task = taskSelect.value;
+      if (mainController) mainController.abort();
+      mainController = new AbortController();
+      setStatus(`主屏生成中：${task}，${mainCount} 条`);
+      try {
+        const nextPayload = await fetchPayload(task, mainCount, mainController);
+        if (seq !== mainSeq) return;
+        mainPayload = nextPayload;
+        renderMain();
+        setStatus(statusFromPayload('主屏已更新', mainPayload), Boolean(mainPayload.cache?.error));
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        setStatus(`主屏刷新失败：${err}`, true);
+      }
+    }
+
+    async function refreshRecommend(advance = false) {
+      const seq = ++recommendSeq;
+      const task = taskSelect.value;
+      if (recommendController) recommendController.abort();
+      recommendController = new AbortController();
+      setStatus(`${advance ? '下一条' : '推荐加载'}中：${task}`);
+      try {
+        const nextPayload = await fetchRecommendation(task, advance, recommendController);
+        if (seq !== recommendSeq) return;
+        recommendPayload = nextPayload;
+        renderRecommend();
+        setStatus(statusFromPayload('推荐已更新', recommendPayload), Boolean(recommendPayload.cache?.error));
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        setStatus(`推荐刷新失败：${err}`, true);
+      }
+    }
+
+    async function init() {
+      const configRes = await fetch('/api/config');
+      const config = await configRes.json();
+      mainCount = Math.max(1, Math.min(1000, Number(config.sample_count) || 100));
+      const bgRes = await fetch('/api/background');
+      const bg = await bgRes.json();
+      background.onload = async () => {
+        drawBackground(mainCtx);
+        drawBackground(recommendCtx);
+        await refreshMain();
+        await refreshRecommend();
+        await pollCollectionEvents();
+        collectionPollTimer = setInterval(pollCollectionEvents, 1000);
+      };
+      background.src = bg.data_url;
+    }
+
+    document.getElementById('sampleBtn').onclick = () => refreshRecommend(true);
+    taskSelect.onchange = async () => {
+      await refreshMain();
+      await refreshRecommend(false);
+    };
+    init().catch(err => setStatus(`加载失败：${err}`, true));
+  </script>
+</body>
+</html>
