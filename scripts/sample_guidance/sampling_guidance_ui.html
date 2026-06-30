@@ -27,48 +27,82 @@
       letter-spacing: 0;
     }
     .app {
-      min-height: 100vh;
+      height: 100vh;
       display: grid;
-      grid-template-rows: 1fr auto;
+      grid-template-rows: auto 1fr auto;
+    }
+    .task-header {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    .task-header .task-label {
+      color: var(--muted);
+      font-size: 24px;
+      font-weight: 600;
+    }
+    .task-header .task-name {
+      color: var(--text);
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: 1px;
     }
     .boards {
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(520px, 3.4fr) minmax(260px, 0.95fr);
+      grid-template-columns: minmax(520px, 3.4fr) minmax(260px, 1fr);
       gap: 14px;
       padding: 14px;
-      max-width: 1900px;
       width: 100%;
-      margin: 0 auto;
+      height: 100%;
     }
     .board {
       min-width: 0;
+      min-height: 0;
       display: grid;
       grid-template-rows: auto 1fr;
       gap: 8px;
     }
+    .board.distribution {
+      grid-template-rows: none;
+      align-content: start;
+    }
     .title {
-      min-height: 28px;
+      min-height: 36px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 18px;
     }
     .title strong {
       color: var(--text);
-      font-size: 18px;
+      font-size: 28px;
       line-height: 1.2;
+    }
+    #recommendMeta {
+      font-size: 28px;
+      font-weight: 700;
+      color: #2aa8ff;
     }
     .canvas-wrap {
       position: relative;
       width: 100%;
-      aspect-ratio: 16 / 9;
-      align-self: center;
+      height: 100%;
+      min-height: 0;
+      align-self: stretch;
       border: 1px solid var(--line);
       background: #050607;
       overflow: hidden;
+    }
+    .board.distribution .canvas-wrap {
+      height: auto;
+      aspect-ratio: 16 / 9;
+      align-self: start;
     }
     .live-background {
       position: absolute;
@@ -81,17 +115,7 @@
     .live-background.ready {
       display: block;
     }
-    .board.distribution {
-      align-self: start;
-    }
-    .board.distribution .canvas-wrap {
-      max-width: 520px;
-      justify-self: end;
-    }
     .board.distribution .title {
-      max-width: 520px;
-      justify-self: end;
-      width: 100%;
       align-items: flex-start;
       flex-direction: column;
       justify-content: flex-start;
@@ -106,7 +130,7 @@
       gap: 2px;
       width: 100%;
       color: #c6d2dd;
-      font-size: 15px;
+      font-size: 18px;
       line-height: 1.25;
     }
     .board.distribution #mainMeta span {
@@ -117,31 +141,29 @@
       border: 1px solid #ff3b3b;
       border-radius: 6px;
       background: rgba(28, 14, 16, 0.55);
-      padding: 10px 12px;
+      padding: 12px 14px;
       color: var(--text);
-      font-size: 14px;
+      font-size: 20px;
       line-height: 1.42;
-      min-height: 92px;
-      max-width: 520px;
+      min-height: 110px;
       width: 100%;
-      justify-self: end;
       overflow-wrap: anywhere;
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 6px;
     }
     .last-collection .lc-header {
       display: flex;
       align-items: center;
-      gap: 8px;
-      font-size: 15px;
+      gap: 10px;
+      font-size: 22px;
       font-weight: 700;
     }
     .last-collection .lc-badge {
       display: inline-block;
-      padding: 1px 8px;
+      padding: 2px 12px;
       border-radius: 999px;
-      font-size: 13px;
+      font-size: 20px;
       font-weight: 700;
       letter-spacing: 0.5px;
     }
@@ -151,30 +173,28 @@
     .last-collection.warn.ok .lc-badge { background: #7a5b1f; color: #ffe9b8; }
     .last-collection .lc-warn {
       color: #ffd98a;
-      font-size: 13px;
+      font-size: 18px;
       white-space: pre-wrap;
       border-left: 3px solid #e0a93b;
-      padding: 4px 8px;
+      padding: 5px 10px;
       background: rgba(122, 91, 31, 0.18);
       border-radius: 3px;
     }
     .last-collection .lc-reason {
       color: #d6dde3;
-      font-size: 13px;
+      font-size: 18px;
       white-space: pre-wrap;
     }
     .last-collection .lc-meta {
       color: var(--muted);
-      font-size: 12px;
+      font-size: 16px;
     }
     .last-collection .lc-empty {
       color: var(--muted);
-      font-size: 13px;
+      font-size: 18px;
     }
     .review-image-wrap {
-      max-width: 520px;
       width: 100%;
-      justify-self: end;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: #050607;
@@ -314,17 +334,15 @@
     }
     @media (max-width: 980px) {
       .boards { grid-template-columns: 1fr; }
-      .board.distribution .canvas-wrap,
-      .board.distribution .title {
-        max-width: none;
-        justify-self: stretch;
-      }
       .title { align-items: flex-start; flex-direction: column; }
     }
   </style>
 </head>
 <body>
   <main class="app">
+    <header class="task-header">
+      <span class="task-label">当前任务：</span><span class="task-name" id="taskName">Centrifuge</span>
+    </header>
     <section class="boards">
       <div class="board recommendation">
         <div class="title">
@@ -381,12 +399,14 @@
     const statusEl = document.getElementById('status');
     const toastEl = document.getElementById('toast');
     const taskSelect = document.getElementById('taskSelect');
+    const taskNameEl = document.getElementById('taskName');
     const lastCollectionEl = document.getElementById('lastCollection');
     const reviewImageWrap = document.getElementById('reviewImageWrap');
     const reviewImage = document.getElementById('reviewImage');
     const colors = { grasp: '#2aa8ff', place: '#ffb23f' };
     const candidateColors = { grasp: '#6ae6ff', place: '#ffe07a' };
     const taskLabels = { centrifuge: '离心机', multidrop: '分液器' };
+    const taskNameEn = { centrifuge: 'Centrifuge', multidrop: 'Multidrop' };
     const keyposeLabels = { grasp: '抓', place: '放' };
     const rejectLabels = {
       overlap: '重叠',
@@ -439,6 +459,10 @@
 
     function taskLabel(task) {
       return taskLabels[task] || task || '未知任务';
+    }
+
+    function updateTaskName(task) {
+      taskNameEl.textContent = taskNameEn[task] || (task || 'unknown');
     }
 
     function keyposeLabel(keypose) {
@@ -668,13 +692,6 @@
       const labels = [];
       const batch = data?.batch;
       if (batch) labels.push(`样本 ${batch.count}/${batch.requested}`);
-      const heights = batch?.heights || {};
-      const placeH = heights[`${task}:place`]?.height_m;
-      if (Number.isFinite(placeH)) labels.push(`${taskLabel(task)} 放 ${placeH.toFixed(3)}m`);
-      const constraints = batch?.constraints || {};
-      if (constraints.workspace_xy) {
-        labels.push(`工作区 ${constraints.workspace_xy.map(v => Number(v).toFixed(2)).join(',')}`);
-      }
       metaEl.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
     }
 
@@ -708,15 +725,11 @@
       ctx.restore();
 
       const batch = data.batch || {};
-      const constraints = batch.constraints || {};
-      const labels = [];
+      let metaText = '';
       if (Number.isFinite(batch.uncollected_count)) {
-        labels.push(`未采集剩余 ${batch.uncollected_count}`);
+        metaText = `未采集剩余 ${batch.uncollected_count}`;
       }
-      if (Number.isFinite(constraints.object_length_m) && Number.isFinite(constraints.object_width_m)) {
-        labels.push(`${(constraints.object_length_m * 100).toFixed(0)}cm x ${(constraints.object_width_m * 100).toFixed(0)}cm`);
-      }
-      metaEl.textContent = labels.join(' / ');
+      metaEl.textContent = metaText;
       drawReviewOverlay(ctx);
     }
 
@@ -957,6 +970,7 @@
         setStatus(`采集有效${label}，自动跳到下一条`);
         if (event.task && event.task !== taskSelect.value) {
           taskSelect.value = event.task;
+          updateTaskName(event.task);
           await refreshMain();
         }
         await refreshRecommend(true);
@@ -1037,6 +1051,7 @@
       const configRes = await fetch('/api/config');
       const config = await configRes.json();
       mainCount = Math.max(1, Number(config.sample_count) || 100);
+      updateTaskName(taskSelect.value);
       if (config.recommend_live_stream_path) {
         recommendLiveBackground.onload = () => {
           recommendLiveReady = true;
@@ -1067,6 +1082,7 @@
     document.getElementById('reviewDeleteBtn').onclick = () => deletePendingReviewFile();
     document.getElementById('reviewKeepBtn').onclick = () => keepPendingReviewFile();
     taskSelect.onchange = async () => {
+      updateTaskName(taskSelect.value);
       await refreshMain();
       await refreshRecommend(false);
     };
